@@ -1,0 +1,6 @@
+faster-whisper
+sounddevice
+numpy
+scipy
+pyttsx3
+requests

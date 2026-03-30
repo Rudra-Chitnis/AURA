@@ -1,0 +1,9 @@
+node_modules/
+.env
+*.wav
+__pycache__/
+*.pyc
+.aura_token
+venv/
+seed.js
+resetpass.js
