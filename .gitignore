@@ -1,0 +1,111 @@
+# ─────────────────────────────────────────────
+# AURA — .gitignore
+# Hybrid Node.js (backend) + Python (voice client) AI assistant
+# ─────────────────────────────────────────────
+
+# ── Secrets & environment ─────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Auth token (stored locally by AURA at runtime) ───
+.aura_token
+
+# ── Node.js ──────────────────────────────────
+node_modules/
+dist/
+build/
+.npm
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ── Python ───────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+.env.bak
+
+# Eggs & packaging
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+.installed.cfg
+lib/
+lib64/
+MANIFEST
+
+# ── Audio / TTS runtime files ─────────────────
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.aac
+*.m4a
+*.tmp.mp3
+
+# ── ML model cache ───────────────────────────
+# faster-whisper / Whisper model weights (large, not source code)
+whisper_models/
+models/
+*.bin
+*.pt
+*.onnx
+*.ot
+# Hugging Face / Xenova transformer cache
+.cache/
+huggingface/
+transformers_cache/
+
+# ── Logs ─────────────────────────────────────
+logs/
+*.log
+log.txt
+
+# ── IDE / Editor ──────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# ── OS generated ──────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ── Dev / admin scripts (project-specific) ───
+seed.js
+resetpass.js
+
+# ── Temporary & runtime ───────────────────────
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
