@@ -103,6 +103,18 @@ desktop.ini
 seed.js
 resetpass.js
 
+# ── Electron build output ─────────────────────
+release/
+desktop/dist/
+desktop/release/
+
+# ── Windows shortcuts ─────────────────────────
+*.lnk
+AURA.lnk
+
+# ── Screenshots (may contain personal info) ───
+screenshots/
+
 # ── Temporary & runtime ───────────────────────
 tmp/
 temp/

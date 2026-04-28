@@ -1,4 +1,10 @@
 import os
+import sys
+# Must be set before numpy / ctranslate2 are imported — limits MKL thread pools
+# that can cause mkl_malloc failures on some systems.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import re
 import io
 import json
@@ -55,6 +61,7 @@ whisper_model = None
 _speak_lock         = threading.Lock()   # prevents overlapping TTS (main + reminder threads)
 _tts_fail_count     = 0                  # consecutive TTS failures — triggers device recovery at 2
 _playback_interrupt = threading.Event()  # set by interrupt monitor when user speaks during TTS
+_paused             = threading.Event()  # set by stdin monitor when Electron sends PAUSE command
 
 # Short-term conversation memory — last 20 exchanges (10 Q+A pairs)
 _conversation_history: deque = deque(maxlen=20)
@@ -134,13 +141,58 @@ def auth_headers():
 
 
 # ─────────────────────────────────────────────
+# UI EVENT PUSH  (non-blocking, best-effort)
+# Posts state updates to the backend which broadcasts via WebSocket
+# to the desktop UI.  All calls are fire-and-forget inside a daemon thread
+# so a network blip never blocks the voice pipeline.
+# ─────────────────────────────────────────────
+def _push_event(event: dict):
+    """Push a JSON event to the desktop UI via backend /api/events/push."""
+    def _send():
+        try:
+            requests.post(
+                f"{BACKEND}/api/events/push",
+                json=event,
+                timeout=2,
+            )
+        except Exception:
+            pass  # UI update is best-effort — never crash voice pipeline
+    threading.Thread(target=_send, daemon=True).start()
+
+
+# ─────────────────────────────────────────────
 # MODELS
 # ─────────────────────────────────────────────
 def load_models():
     global whisper_model
     print(f"Loading Whisper '{WHISPER_MODEL_SIZE}' model...")
-    whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+    # float32 avoids MKL quantized kernels that cause mkl_malloc failures on some CPUs.
+    whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="float32")
     print("Models ready.\n")
+
+
+# ─────────────────────────────────────────────
+# STDIN COMMAND MONITOR
+# Runs as a daemon thread in AUTO_MODE (Electron).
+# Reads PAUSE / RESUME commands written by main.js to voice.py's stdin.
+# ─────────────────────────────────────────────
+def _stdin_monitor():
+    """Read line commands from stdin (sent by Electron via voiceProc.stdin.write)."""
+    try:
+        for line in sys.stdin:
+            cmd = line.strip().upper()
+            if cmd == "PAUSE":
+                _paused.set()
+                _push_event({"type": "voice", "state": "idle"})
+                print("[voice] Paused by user.", flush=True)
+            elif cmd == "RESUME":
+                _paused.clear()
+                print("[voice] Resumed by user.", flush=True)
+            elif cmd == "QUIT":
+                print("[voice] Quit command received.", flush=True)
+                raise SystemExit(0)
+    except (EOFError, OSError):
+        pass  # stdin closed — normal on Electron shutdown
 
 
 # ─────────────────────────────────────────────
@@ -326,12 +378,33 @@ def record_audio(filename="input.wav"):
 
 
 def transcribe_audio(filename="input.wav"):
+    global whisper_model
     print("Transcribing...")
-    segments, _ = whisper_model.transcribe(
-        filename, language="en", beam_size=3, vad_filter=True
-    )
-    text = " ".join(seg.text for seg in segments).strip().lower()
-    return correct_names(clean_transcript(text))
+    try:
+        segments, _ = whisper_model.transcribe(
+            filename, language="en", beam_size=3, vad_filter=True
+        )
+        text = " ".join(seg.text for seg in segments).strip().lower()
+        return correct_names(clean_transcript(text))
+    except RuntimeError as e:
+        err = str(e)
+        if "mkl_malloc" in err or "failed to allocate" in err or "out of memory" in err.lower():
+            print("[STT] Memory error — reloading Whisper model and retrying...")
+            try:
+                import gc
+                whisper_model = None
+                gc.collect()
+                whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="float32")
+                segments, _ = whisper_model.transcribe(
+                    filename, language="en", beam_size=3, vad_filter=True
+                )
+                text = " ".join(seg.text for seg in segments).strip().lower()
+                return correct_names(clean_transcript(text))
+            except Exception as reload_err:
+                print(f"[STT] Reload failed: {reload_err}")
+                return ""
+        print(f"[STT] Transcription error: {e}")
+        return ""
 
 
 # ─────────────────────────────────────────────
@@ -353,13 +426,20 @@ def speak(text, _report_failure=True):
     print(f"AURA: {text}")
     with _speak_lock:
         audio_played = False
-        try:
-            asyncio.run(_speak_edge(text))
-            audio_played = True
-        except asyncio.TimeoutError:
-            print("TTS error: edge-tts timed out (10s)")
-        except Exception as e:
-            print(f"TTS error [{type(e).__name__}]: {e}")
+        # Retry up to 3 times with increasing backoff before falling back to SAPI.
+        # Handles transient network blips, edge-tts cold-start failures, and brief
+        # Microsoft TTS service hiccups — which are the primary cause of random fallbacks.
+        for _try in range(3):
+            try:
+                asyncio.run(_speak_edge(text))
+                audio_played = True
+                break
+            except asyncio.TimeoutError:
+                print(f"[TTS] edge-tts timeout (attempt {_try+1}/3)")
+            except Exception as e:
+                print(f"[TTS] edge-tts error [{type(e).__name__}] (attempt {_try+1}/3): {e}")
+            if _try < 2:
+                time.sleep(0.6 * (_try + 1))   # 0.6 s → 1.2 s backoff
         if not audio_played:
             audio_played = _speak_fallback(text)
         if audio_played:
@@ -380,9 +460,9 @@ def speak(text, _report_failure=True):
 
 
 async def _speak_edge(text):
-    # 20s covers edge-tts cold-start latency (first call in a session opens a new
-    # HTTPS connection; subsequent calls reuse it and are much faster).
-    audio_bytes = await asyncio.wait_for(_generate_tts_bytes(text), timeout=20.0)
+    # 30s covers edge-tts cold-start latency on slower connections.
+    # Retry logic lives in the callers (speak / _generate thread).
+    audio_bytes = await asyncio.wait_for(_generate_tts_bytes(text), timeout=30.0)
     _play_audio_bytes(audio_bytes)
 
 
@@ -464,10 +544,12 @@ def _play_mp3_subprocess(filepath):
 
     # Try PowerShell MediaPlayer (WPF-based, available on all modern Windows without extra installs)
     try:
+        # Convert Windows path to a proper file:/// URI so [uri] cast succeeds
+        file_uri = "file:///" + filepath.replace("\\", "/")
         ps_script = (
             f"Add-Type -AssemblyName PresentationCore; "
             f"$mp = New-Object System.Windows.Media.MediaPlayer; "
-            f"$mp.Open([uri]'{filepath}'); "
+            f"$mp.Open([uri]'{file_uri}'); "
             f"Start-Sleep -Milliseconds 800; "
             f"$mp.Play(); "
             f"$dur = 0; $wait = 0; "
@@ -479,7 +561,7 @@ def _play_mp3_subprocess(filepath):
             f"$mp.Close()"
         )
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            ["powershell", "-NoProfile", "-NonInteractive", "-STA", "-Command", ps_script],
             timeout=120
         )
         if result.returncode == 0:
@@ -491,20 +573,48 @@ def _play_mp3_subprocess(filepath):
 
 
 def _play_mp3_bytes(mp3_bytes):
-    """Write MP3 bytes to a temp file and play via subprocess."""
+    """Write MP3 bytes to a temp file and play via MCI → subprocess → return False."""
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             f.write(mp3_bytes)
             tmp_path = f.name
-        ok = _play_mp3_subprocess(tmp_path)
-        return ok
+
+        # 1st attempt: pygame (pip install pygame — reliable cross-platform MP3)
+        try:
+            import pygame
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+            pygame.mixer.music.load(tmp_path)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.05)
+            pygame.mixer.music.unload()
+            return True
+        except ImportError:
+            pass   # pygame not installed — try next
+        except Exception as e:
+            print(f"[TTS] pygame error: {e}")
+
+        # 2nd attempt: Windows MCI (built-in)
+        try:
+            _play_mp3_mci(tmp_path)
+            return True
+        except Exception as e:
+            print(f"[TTS] MCI error: {e}")
+
+        # 3rd attempt: subprocess (ffplay / PowerShell MediaPlayer)
+        if _play_mp3_subprocess(tmp_path):
+            return True
+
+        return False
     except Exception as e:
         print(f"[TTS] MP3 temp write error: {e}")
         return False
     finally:
         if tmp_path:
             try:
+                time.sleep(0.2)   # let MCI finish releasing the file handle
                 os.unlink(tmp_path)
             except Exception:
                 pass
@@ -697,16 +807,24 @@ def _stop_all_playback():
 # when followed by ":" (role-label format) or as multi-word prompt headers.
 _LEAK_KEYWORDS = re.compile(
     r'^(?:'
-    # "User:", "Human:", "You:" — model echoing the user's prompt turn back as output
-    # Do NOT include "aura:", "assistant:", "a:" here — those prefix real content and
-    # should be STRIPPED (via _LEADING_LABEL_RE), not dropped entirely.
+    # Role labels — model echoing prompt structure
     r'(?:user|human|you)\s*:'
-    r'|query\s*type'                   # never in natural speech
-    r'|thinking\s*step'               # never in natural speech
-    r'|recent\s*conversation'         # prompt section header
-    r'|your\s*last\s*responses'      # prompt section header
-    r'|spoken\s*response\s*:'        # prompt label with colon
-    r'|what\s*you\s*know\s*about'   # prompt section header
+    r'|query\s*type'
+    r'|thinking\s*step'
+    r'|recent\s*conversation'
+    r'|your\s*last\s*responses'
+    r'|spoken\s*response\s*:'
+    r'|what\s*you\s*know\s*about\s*the\s*user'
+    # Prompt-internal question/instruction patterns leaking through LLM
+    r'|question\s*:'              # "Question: ..." prompt echo
+    r'|\(says\s*["\']'           # "(says "..." meta-instruction
+    r'|no\s+personal\s+data'     # prompt rule leaking verbatim
+    r'|no\s+need\s+to\s+say'    # prompt rule leaking verbatim
+    r'|context\s*:'              # prompt section header
+    r'|instructions?\s*:'        # prompt section header
+    r'|memory\s*:'               # prompt section header
+    r'|facts?\s*:'               # prompt section header
+    r'|route\s*[:\-—]'          # "route: ..." routing instruction
     r')',
     re.IGNORECASE
 )
@@ -779,7 +897,8 @@ def _is_valid_response(text):
     for kw in (
         "thinking step", "query type", "route —",
         "output rules", "recent conversation",
-        "what you know about the user",
+        "what you know about the user:",
+        "no personal data", "no need to say",
     ):
         if kw in low:
             return False
@@ -864,20 +983,28 @@ def speak_stream(sentence_iter):
                 audio_q.put(_DONE)
                 return
             audio_bytes = None
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+            # Retry up to 3 times per chunk — same rationale as speak().
+            # 28s timeout: edge-tts cold-start on a congested connection can be 10-15s.
+            for _try in range(3):
                 try:
-                    audio_bytes = loop.run_until_complete(
-                        asyncio.wait_for(_generate_tts_bytes(item), timeout=15.0)
-                    )
-                finally:
-                    loop.close()
-                    asyncio.set_event_loop(None)
-            except asyncio.TimeoutError:
-                print("[generate] TTS generation timed out — will use SAPI for this chunk")
-            except Exception as e:
-                print(f"[generate] TTS error [{type(e).__name__}]: {e}")
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        audio_bytes = loop.run_until_complete(
+                            asyncio.wait_for(_generate_tts_bytes(item), timeout=28.0)
+                        )
+                    finally:
+                        loop.close()
+                        asyncio.set_event_loop(None)
+                    break   # success — exit retry loop
+                except asyncio.TimeoutError:
+                    print(f"[generate] TTS timeout (attempt {_try+1}/3)")
+                except Exception as e:
+                    print(f"[generate] TTS error (attempt {_try+1}/3) [{type(e).__name__}]: {e}")
+                if _try < 2:
+                    time.sleep(0.8 * (_try + 1))   # 0.8 s → 1.6 s backoff
+            if audio_bytes is None:
+                print("[generate] All 3 TTS attempts failed — SAPI will cover this chunk")
             audio_q.put((item, audio_bytes))
 
     t_fill = threading.Thread(target=_fill,     daemon=True)
@@ -1626,24 +1753,80 @@ if __name__ == "__main__":
     ensure_authenticated()
     load_models()
 
+    # Detect whether we're running inside Electron (no interactive terminal).
+    # When spawned by Electron, stdin is a pipe — isatty() returns False.
+    AUTO_MODE = not sys.stdin.isatty()
+
     poll_thread = threading.Thread(target=reminder_poll_loop, daemon=True)
     poll_thread.start()
 
-    print("AURA is ready. Say anything after pressing Enter.\n")
+    # ── Pre-warm edge-tts connection ─────────────────────────────────────────
+    # The first edge-tts call in a session opens a new HTTPS connection to Microsoft
+    # TTS servers (DNS + TCP + TLS = ~300-800 ms, sometimes longer).  Pre-warming
+    # here — before the greeting — ensures every subsequent call reuses a warm
+    # connection, eliminating cold-start failures that cause SAPI fallbacks.
+    print("[TTS] Warming up edge-tts connection...")
+    _warm_ok = False
+    try:
+        _wloop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_wloop)
+        try:
+            _warm_bytes = _wloop.run_until_complete(
+                asyncio.wait_for(_generate_tts_bytes("hi"), timeout=14.0)
+            )
+            _warm_ok = bool(_warm_bytes)
+        finally:
+            _wloop.close()
+            asyncio.set_event_loop(None)
+    except Exception as _we:
+        print(f"[TTS] pre-warm error ({type(_we).__name__}): {_we}")
+    print(f"[TTS] edge-tts {'ready ✓' if _warm_ok else 'unavailable — SAPI fallback active'}.")
+
+    # ── Startup greeting ─────────────────────────────────────────────────────
+    _greeting = "Welcome back, Rudra."
+    print(f"AURA: {_greeting}")
+    _push_event({"type": "voice", "state": "speaking", "text": _greeting})
+    speak(_greeting, _report_failure=False)
+    _push_event({"type": "voice", "state": "idle"})
+
+    # ── Signal Electron that AURA is fully ready ─────────────────────────────
+    # Electron's main.js watches for this exact line on stdout to transition
+    # the UI from the splash screen to the ready state.
+    print("AURA:VOICE_READY", flush=True)
+
+    if AUTO_MODE:
+        print("AURA is ready. Running in continuous listening mode.\n", flush=True)
+        # Start stdin monitor so Electron can send PAUSE / RESUME commands
+        threading.Thread(target=_stdin_monitor, daemon=True).start()
+    else:
+        print("AURA is ready. Press Enter to speak (Ctrl+C to quit).\n")
 
     _was_interrupted = False   # True = skip Enter keypress, go straight to recording
 
     while True:
+        # ── Pause support — Electron can suspend the listen loop ─────────────
+        if _paused.is_set():
+            time.sleep(0.4)
+            continue
+
         # ── Clear interrupt state for this turn ─────────────────────
         _playback_interrupt.clear()
 
-        # ── Wait for Enter (skip if user interrupted AURA last turn) ─
+        # ── Wait for trigger (Enter in terminal, auto-loop in Electron) ─
         if not _was_interrupted:
-            try:
-                input("Press Enter to speak (Ctrl+C to quit)...")
-            except KeyboardInterrupt:
-                print("\nGoodbye.")
-                break
+            if AUTO_MODE:
+                time.sleep(0.3)   # brief pause between continuous listening cycles
+            else:
+                try:
+                    input("Press Enter to speak (Ctrl+C to quit)...")
+                except KeyboardInterrupt:
+                    print("\nGoodbye.")
+                    _push_event({"type": "voice", "state": "idle"})
+                    break
+                except EOFError:
+                    # stdin was closed (e.g. pipe from Electron) — switch to auto mode
+                    AUTO_MODE = True
+                    time.sleep(0.3)
         else:
             print("(Interrupted — listening...)")
         _was_interrupted = False
@@ -1653,15 +1836,19 @@ if __name__ == "__main__":
         # while TTS is playing (INPUT device ≠ OUTPUT device on most systems).
         threading.Thread(target=_interrupt_monitor, daemon=True).start()
 
+        _push_event({"type": "voice", "state": "listening"})
         record_audio()
+        _push_event({"type": "voice", "state": "thinking"})
         text = transcribe_audio()
 
         if not text:
             print("(Nothing clear detected — try again)")
+            _push_event({"type": "voice", "state": "idle"})
             speak("I didn't catch that... try again.")
             continue
 
         print(f"You said: {text}")
+        _push_event({"type": "voice", "state": "thinking", "text": text})
 
         intent = detect_intent(text)
 
@@ -1670,7 +1857,9 @@ if __name__ == "__main__":
             duration = parse_timer_duration(text)
             answer   = set_local_timer(duration) if duration else \
                        "How long? Try saying 'set a timer for 5 minutes'."
+            _push_event({"type": "voice", "state": "speaking", "text": answer})
             speak(answer)
+            _push_event({"type": "voice", "state": "idle"})
             _conversation_history.append({"role": "user",      "content": text})
             _conversation_history.append({"role": "assistant", "content": answer})
 
@@ -1690,13 +1879,21 @@ if __name__ == "__main__":
                 q = _extract_spotify_query(text.lower()) or _extract_search_query(text.lower())
                 _last_action_context.update({"app_key": app_key, "query": q})
 
+            # Push action event to UI before speaking
+            q_push = _extract_spotify_query(text.lower()) or _extract_search_query(text.lower()) or ""
+            _push_event({"type": "action", "action": "open", "app": app_key,
+                         "query": q_push, "timestamp": datetime.now().isoformat()})
+            _push_event({"type": "voice", "state": "speaking", "text": answer})
             speak(answer)
+            _push_event({"type": "voice", "state": "idle"})
             _conversation_history.append({"role": "user",      "content": text})
             _conversation_history.append({"role": "assistant", "content": answer})
 
         elif intent in ("set_reminder", "store_memory"):
             answer = process_command(text)
+            _push_event({"type": "voice", "state": "speaking", "text": answer})
             speak(answer)
+            _push_event({"type": "voice", "state": "idle"})
             _conversation_history.append({"role": "user",      "content": text})
             _conversation_history.append({"role": "assistant", "content": answer})
 
@@ -1716,11 +1913,14 @@ if __name__ == "__main__":
                     # Speak immediate acknowledgment while LLM generates in background
                     speak("That sounds tough.")
 
+                _push_event({"type": "voice", "state": "thinking", "text": text})
                 try:
                     response = speak_stream(get_answer_stream(text))
                 except Exception as e:
                     print(f"Pipeline error: {e}")
                     response = ""
+                finally:
+                    _push_event({"type": "voice", "state": "idle"})
 
                 # Handle interrupt: skip Enter next turn
                 if _playback_interrupt.is_set():
@@ -1729,5 +1929,7 @@ if __name__ == "__main__":
 
                 if response and response.strip() != _last_response.strip():
                     _last_response = response
+                    # Push completed response to UI chat
+                    _push_event({"type": "voice", "state": "speaking", "text": response})
                     _conversation_history.append({"role": "user",      "content": text})
                     _conversation_history.append({"role": "assistant", "content": response})

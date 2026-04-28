@@ -1,6 +1,22 @@
+# AURA Voice Client — Python Dependencies
+# Install with: pip install -r requirements.txt
+#
+# Python 3.10–3.12 recommended.
+# Python 3.13+ may lack binary wheels for ctranslate2 (faster-whisper dep).
+# If pip fails on ctranslate2, install Python 3.11 or 3.12 from https://python.org/downloads/
+
+# ── Speech-to-text ────────────────────────────
 faster-whisper>=1.0.0
+
+# ── Text-to-speech ────────────────────────────
 edge-tts>=6.1.0
+
+# ── Audio I/O ─────────────────────────────────
 sounddevice>=0.4.6
 scipy>=1.11.0
+
+# ── Numerical ─────────────────────────────────
 numpy>=1.24.0
+
+# ── HTTP / backend comms ──────────────────────
 requests>=2.31.0

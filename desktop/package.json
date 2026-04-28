@@ -1,0 +1,61 @@
+{
+  "name": "aura-desktop",
+  "version": "1.0.0",
+  "description": "AURA — Adaptive User Response Assistant — Desktop App",
+  "author": "Rudra Chitnis & Sadgi Garg",
+  "license": "MIT",
+  "keywords": ["ai", "voice-assistant", "electron", "llm"],
+  "main": "main.js",
+  "scripts": {
+    "dev": "concurrently -k -n VITE,ELECTRON -c cyan,magenta \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "build": "vite build",
+    "dist": "vite build && electron-builder",
+    "start": "electron .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "zustand": "^4.5.2"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.17",
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^28.3.3",
+    "electron-builder": "^24.13.3",
+    "postcss": "^8.4.35",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "tailwindcss": "^3.4.1",
+    "vite": "^5.1.4",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.aura.assistant",
+    "productName": "AURA",
+    "copyright": "Copyright © 2026 Rudra Chitnis & Sadgi Garg",
+    "files": [
+      "dist/**/*",
+      "main.js",
+      "preload.js",
+      "assets/**/*"
+    ],
+    "directories": {
+      "buildResources": "assets",
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}

@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const connectMongo = require("./config/mongo");
+const wsHub = require("./wsHub");
 
 const logRoute = require("./routes/logRoute");
 const authRoute = require("./routes/authRoute");
@@ -47,6 +48,26 @@ app.get("/", (req, res) => {
   res.send("AURA backend running");
 });
 
+// Health probe — used by Electron main.js to know when the backend is ready.
+// Returns 200 only when both Express AND MongoDB are connected.
+// Electron polls this before starting voice.py, so voice.py can authenticate immediately.
+app.get("/api/health", (_req, res) => {
+  const mongoose = require("mongoose");
+  // readyState: 0=disconnected, 1=connected, 2=connecting, 3=disconnecting
+  if (mongoose.connection.readyState === 1) {
+    res.json({ ok: true });
+  } else {
+    res.status(503).json({ ok: false, reason: "mongodb_not_ready" });
+  }
+});
+
+// ── Real-time event push (no auth — localhost only, used by voice.py + Electron)
+app.post("/api/events/push", (req, res) => {
+  const event = req.body;
+  const count = wsHub.broadcast(event);
+  res.json({ ok: true, clients: count });
+});
+
 // Global error handler — must be AFTER all routes
 app.use(errorHandler);
 
@@ -55,4 +76,5 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`AURA backend running on port ${PORT}`);
   startReminderScheduler();
+  wsHub.start(5001);   // start WebSocket hub for real-time UI updates
 });
