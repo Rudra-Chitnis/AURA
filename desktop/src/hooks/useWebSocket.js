@@ -20,6 +20,7 @@ export default function useWebSocket() {
     addToast,
     reminders,
     setReminders,
+    addDebugEvent,
   } = useStore();
 
   const handleEvent = useCallback((event) => {
@@ -85,13 +86,20 @@ export default function useWebSocket() {
           break;
         }
 
+        // ── Debug events from Node.js backend (via wsHub broadcast) ──────
+        // These are emitted by debugLogger.js _broadcast() calls.
+        // Type prefix is "debug:" (e.g. "debug:mode", "debug:memory").
         default:
+          if (msg.type && msg.type.startsWith("debug:")) {
+            // Strip the "debug:" prefix so the store handler sees the plain type
+            addDebugEvent({ ...msg, type: msg.type.slice("debug:".length), source: "node" });
+          }
           break;
       }
     } catch (e) {
       console.warn("[WS] parse error:", e);
     }
-  }, [setVoiceState, setVoiceTranscript, setCurrentResponse, addMessage, startStreaming, addAction, addToast, setReminders]);
+  }, [setVoiceState, setVoiceTranscript, setCurrentResponse, addMessage, startStreaming, addAction, addToast, setReminders, addDebugEvent]);
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;

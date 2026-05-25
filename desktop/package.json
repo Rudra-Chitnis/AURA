@@ -38,6 +38,8 @@
       "dist/**/*",
       "main.js",
       "preload.js",
+      "timerManager.js",
+      "reminderManager.js",
       "assets/**/*"
     ],
     "directories": {

@@ -1,0 +1,20 @@
+{
+  "watch": [
+    "server.js",
+    "routes",
+    "services",
+    "models",
+    "middleware",
+    "config",
+    "utils",
+    "wsHub.js"
+  ],
+  "ext": "js,json",
+  "ignore": [
+    "node_modules",
+    "*.log",
+    "*.tmp",
+    "*.lock"
+  ],
+  "delay": "500"
+}

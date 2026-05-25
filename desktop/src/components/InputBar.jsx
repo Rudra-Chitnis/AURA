@@ -93,7 +93,7 @@ const InputBar = () => {
       const result = await window.aura?.voiceStart();
       if (result === "started") {
         setVoiceProcess("running");
-        addToast({ type: "success", message: "Voice mode started — press Enter in terminal to speak" });
+        addToast({ type: "success", message: "Voice mode started — AURA is now listening" });
       } else {
         addToast({ type: "error", message: "Could not start voice mode. Is voice.py present?" });
       }

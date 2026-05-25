@@ -1,14 +1,16 @@
 import { useEffect, useState } from "react";
 import useStore from "./store/useStore";
-import { setToken as apiSetToken, setBaseUrl, healthCheck, login, register } from "./lib/api";
+import { setToken as apiSetToken, setBaseUrl, healthCheck, getProfile, login, register } from "./lib/api";
 import useWebSocket from "./hooks/useWebSocket";
 
-import TitleBar    from "./components/TitleBar";
-import VoiceDisplay from "./components/VoiceDisplay";
-import CompactBar  from "./components/CompactBar";
-import DrawerPanel from "./components/DrawerPanel";
-import ToastStack  from "./components/ToastStack";
-import SplashScreen from "./components/SplashScreen";
+import TitleBar      from "./components/TitleBar";
+import VoiceDisplay  from "./components/VoiceDisplay";
+import CompactBar    from "./components/CompactBar";
+import DrawerPanel   from "./components/DrawerPanel";
+import ToastStack    from "./components/ToastStack";
+import SplashScreen  from "./components/SplashScreen";
+import CountdownPanel from "./components/CountdownPanel";
+import DebugPanel    from "./components/DebugPanel";
 
 // ── Auth card (shown when not logged in) ──────────────────────────────────
 const AuthCard = () => {
@@ -144,6 +146,7 @@ export default function App() {
   const {
     settings,
     token,
+    user,
     isAuthenticated,
     setToken,
     setUser,
@@ -151,6 +154,10 @@ export default function App() {
     setVoicePaused,
     startupPhase,
     setStartupPhase,
+    hydrateSettings,
+    addToast,
+    debugEnabled,
+    setDebugEnabled,
   } = useStore();
 
   const [backendOnline, setBackendOnline] = useState(null);
@@ -158,14 +165,20 @@ export default function App() {
   // Connect WebSocket event hub
   useWebSocket();
 
-  // Restore token from ~/.aura_token on launch
+  // Restore token AND settings from disk on launch (runs once)
   useEffect(() => {
     (async () => {
       try {
-        const saved = await window.aura?.getToken();
-        if (saved) {
-          setToken(saved);
-          apiSetToken(saved);
+        const [savedToken, savedSettings] = await Promise.all([
+          window.aura?.getToken(),
+          window.aura?.loadSettings(),
+        ]);
+        if (savedToken) {
+          setToken(savedToken);
+          apiSetToken(savedToken);
+        }
+        if (savedSettings) {
+          hydrateSettings(savedSettings);
         }
       } catch {}
     })();
@@ -176,6 +189,32 @@ export default function App() {
 
   // Sync backend URL
   useEffect(() => { setBaseUrl(settings.backendUrl); }, [settings.backendUrl]);
+
+  // ── Validate stored token once backend is confirmed online ────────────────
+  // isAuthenticated is set by token PRESENCE (not validity), so a stale/expired
+  // token on disk will hide the AuthCard and deadlock the user.
+  // This effect runs the first time the backend comes online with a token but
+  // no validated user object, checks the token against /api/auth/profile,
+  // and clears the token (showing AuthCard) if the backend rejects it.
+  useEffect(() => {
+    if (!backendOnline || !token || user) return;
+    (async () => {
+      try {
+        const data = await getProfile();
+        setUser(data.user);
+      } catch (err) {
+        const is401 = /401|not authorized/i.test(err?.message ?? "");
+        if (is401) {
+          // Token definitively rejected — force re-login
+          setToken(null);
+          apiSetToken(null);
+          window.aura?.clearToken();
+          addToast({ type: "error", message: "Session expired — please sign in." });
+        }
+        // Network/timeout error: leave token in place, retry on next health tick
+      }
+    })();
+  }, [backendOnline, token]);
 
   // Backend health check every 12s (only after splash is done)
   useEffect(() => {
@@ -195,8 +234,9 @@ export default function App() {
     const cleanup = window.aura.onStartupPhase((phase) => {
       setStartupPhase(phase);
     });
-    // Safety net: if Electron never sends "ready" within 90 s, unblock UI
-    const timeout = setTimeout(() => setStartupPhase("ready"), 90000);
+    // Safety net: if Electron never sends "ready" within 200s, unblock UI.
+    // 200s > main.js 180s timeout, so this only fires if IPC itself fails.
+    const timeout = setTimeout(() => setStartupPhase("ready"), 200000);
     return () => {
       cleanup?.();
       clearTimeout(timeout);
@@ -205,7 +245,30 @@ export default function App() {
 
   // ── Listen for voice process status from Electron main ────────────────
   useEffect(() => {
-    const cleanup = window.aura?.onVoiceStatus((status) => setVoiceProcess(status));
+    const cleanup = window.aura?.onVoiceStatus((status) => {
+      setVoiceProcess(status);
+      if (status === "failed") {
+        addToast({
+          type:    "error",
+          message: "Voice pipeline stopped after too many restarts. Check %APPDATA%\\AURA\\logs\\ for details.",
+          duration: 30000,
+        });
+      }
+    });
+    return cleanup;
+  }, []);
+
+  // ── Listen for backend service status from Electron main ──────────────
+  useEffect(() => {
+    const cleanup = window.aura?.onBackendStatus((status) => {
+      if (status === "failed") {
+        addToast({
+          type:    "error",
+          message: "Backend service failed to recover. Typed chat and memory are unavailable. Check %APPDATA%\\AURA\\logs\\.",
+          duration: 30000,
+        });
+      }
+    });
     return cleanup;
   }, []);
 
@@ -223,6 +286,15 @@ export default function App() {
       });
     }
   }, [isAuthenticated]);
+
+  // ── Debug mode detection ──────────────────────────────────────────────────
+  // Check once at startup whether AURA_DEBUG=true is set in the Electron env.
+  // The DebugPanel is only rendered when true — zero overhead in production.
+  useEffect(() => {
+    window.aura?.getDebugMode?.().then((enabled) => {
+      if (enabled) setDebugEnabled(true);
+    }).catch(() => {});
+  }, []);
 
   return (
     <div
@@ -244,6 +316,9 @@ export default function App() {
       {/* Voice display (orb + transcript) */}
       <VoiceDisplay />
 
+      {/* Active timer / reminder countdown strip — hidden when empty */}
+      <CountdownPanel />
+
       {/* Bottom bar (text input + drawer triggers) */}
       <CompactBar />
 
@@ -258,6 +333,9 @@ export default function App() {
 
       {/* Splash screen — shown during startup, disappears when ready */}
       <SplashScreen phase={startupPhase} />
+
+      {/* Debug overlay — only rendered when AURA_DEBUG=true */}
+      {debugEnabled && <DebugPanel />}
     </div>
   );
 }

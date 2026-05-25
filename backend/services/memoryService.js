@@ -1,6 +1,7 @@
 const Memory = require("../models/memoryModel");
 const { generateEmbedding } = require("./embeddingService");
 const cosineSimilarity = require("../utils/similarity");
+const dbg = require("../utils/debugLogger");
 
 
 // ─────────────────────────────────────────────
@@ -60,7 +61,11 @@ const parseStructuredMemory = (raw) => {
 
   // ── IDENTITY ─────────────────────────────────────────────────────────────
   m = text.match(/^(?:my name is|i am called|call me|i go by)\s+(.+)$/);
-  if (m) return { person: m[1].trim(), attribute: "name", value: m[1].trim(), confidence: "high" };
+  // person must be "user" here — same as every other self-referential pattern.
+  // Using person=value caused: (a) third-person formatting ("rudra lives in X"),
+  // (b) scalar dedup mismatches if a second name pattern used person="user",
+  // (c) artificial score inflation in memory search entity boosting.
+  if (m) return { person: "user", attribute: "name", value: m[1].trim(), confidence: "high" };
 
   m = text.match(/^(?:i live in|i'm from|i am from|i stay in|i'm based in|i am based in)\s+(.+)$/);
   if (m) return { person: "user", attribute: "lives_in", value: m[1].trim(), confidence: "high" };
@@ -246,6 +251,23 @@ const pruneMemories = async (userId) => {
 };
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// OWNER IDENTITY NAMES
+//
+// Names that refer to the owner/user themselves — kept in sync with
+// CANONICAL_ENTITIES / OWNER_ENTITY_NAMES in aiService.js.
+//
+// Purpose: when a query contains one of these names, all memories stored
+// with person:"user" are boosted because those facts ARE about the owner.
+// Without this mapping, "What do you know about Rudra Chitnis?" would find
+// zero user memories (person:"user" doesn't match entity "rudra chitnis"),
+// producing a "Memories: 0" log line and triggering public-knowledge fallback.
+//
+// Kept local to memoryService to avoid a circular import with aiService.
+// Must be updated if CANONICAL_ENTITIES / OWNER_ENTITY_NAMES changes.
+// ─────────────────────────────────────────────────────────────────────────────
+const OWNER_NAMES = new Set(["rudra chitnis", "rudra", "chitnis"]);
+
 // ─────────────────────────────────────────────
 // NAME VARIANT TABLE — STT mishearing normalization
 // Supplements voice.py's fuzzy correction for anything that slips through.
@@ -323,7 +345,25 @@ const searchMemory = async (userId, query) => {
   const queryLow       = query.toLowerCase();
   const now            = Date.now();
 
-  const results = memories
+  // ── OWNER IDENTITY MAPPING ───────────────────────────────────────────────
+  // Detect if query references the owner by name ("What do you know about
+  // Rudra Chitnis?").  In MongoDB all user facts are stored with person:"user",
+  // not person:"Rudra Chitnis" — so a naive personBoost check would miss them.
+  //
+  // When ownerRef=true, memories with person:"user" receive an elevated
+  // personBoost because they ARE about the person named in the query.
+  // Threshold is also lowered to 0.25 (from 0.35) so structured facts
+  // with lower embedding similarity still surface.
+  const ownerRef = [...OWNER_NAMES].some(n => queryLow.includes(n));
+
+  // Dynamic threshold: identity queries use a lower bar to ensure structured
+  // user facts (name, birthday, city, relationships) are never dropped.
+  const threshold = ownerRef ? 0.25 : 0.35;
+
+  // ── STEP 1: score all candidates (no filter yet) ─────────────────────────
+  // Split scoring from filtering so the debug logger can report both what was
+  // accepted AND what was rejected, with full score breakdown.
+  const allScored = memories
     .filter(mem => mem.embedding && mem.embedding.length > 0)
     .map(mem => {
       const base   = cosineSimilarity(queryEmbedding, mem.embedding);
@@ -336,10 +376,15 @@ const searchMemory = async (userId, query) => {
       let personBoost = 0;
       if (mem.person) {
         const pLow = mem.person.toLowerCase();
+        // Standard: query contains the memory's person field
         if (queryLow.includes(pLow) || entities.includes(pLow)) personBoost = 0.15;
+        // Owner identity: "user" facts ARE the owner's facts.
+        // Boost them when the query names the owner directly.
+        // Max() preserves the higher of both boosts if both conditions hold.
+        if (ownerRef && pLow === "user") personBoost = Math.max(personBoost, 0.20);
       }
 
-      const ageDays     = (now - new Date(mem.createdAt).getTime()) / 86_400_000;
+      const ageDays      = (now - new Date(mem.createdAt).getTime()) / 86_400_000;
       const recencyBoost = ageDays < 7 ? 0.05 : ageDays < 30 ? 0.02 : 0;
 
       const confidenceAdj = mem.confidence === "medium" ? -0.03
@@ -354,31 +399,27 @@ const searchMemory = async (userId, query) => {
         confidence: mem.confidence || "high",
         score:      Math.min(1, base + entityBoost + personBoost + recencyBoost + confidenceAdj)
       };
-    })
-    .filter(r => r.score > 0.35)
+    });
+
+  // ── STEP 2: threshold filter + sort + cap ─────────────────────────────────
+  const accepted = allScored.filter(r => r.score > threshold)
     .sort((a, b) => b.score - a.score)
     .slice(0, 5);
+  const rejected = allScored.filter(r => r.score <= threshold);
+
+  // ── STEP 3: emit debug trace before quality gate ──────────────────────────
+  try { if (dbg.DEBUG) dbg.memorySearch(query, ownerRef, threshold, allScored, accepted, rejected); } catch (_) {}
 
   // Quality gate: if 3+ results are strong (>0.55), drop any weak stragglers (<0.45).
   // A mediocre match adds noise — it's better to give the LLM 3 confident facts
   // than 5 where the last two are weakly related guesses.
-  const strong = results.filter(r => r.score > 0.55);
-  return strong.length >= 3 ? strong.slice(0, 5) : results;
-};
-
-
-// ─────────────────────────────────────────────
-// CONTEXT-AWARE QUERY CORRECTION
-// ─────────────────────────────────────────────
-const correctQueryWithMemory = (query, memories) => {
-  if (!memories || memories.length === 0) return query;
-  const topMemory    = memories[0].content.toLowerCase();
-  let correctedQuery = query.toLowerCase();
-  if (correctedQuery.includes("day")  && topMemory.includes("date"))
-    correctedQuery = correctedQuery.replace("day",  "date");
-  if (correctedQuery.includes("data") && topMemory.includes("date"))
-    correctedQuery = correctedQuery.replace("data", "date");
-  return correctedQuery;
+  // Exception: owner-ref queries skip this gate — even moderate-score user facts
+  // (0.25–0.45) are more trustworthy than anything the LLM would hallucinate.
+  if (!ownerRef) {
+    const strong = accepted.filter(r => r.score > 0.55);
+    return strong.length >= 3 ? strong.slice(0, 5) : accepted;
+  }
+  return accepted;
 };
 
 
@@ -386,7 +427,6 @@ module.exports = {
   storeMemory,
   getMemories,
   searchMemory,
-  correctQueryWithMemory,
   isWorthStoring,
   parseStructuredMemory
 };

@@ -37,22 +37,40 @@ const cancelReminder = async (userId, reminderId) => {
 };
 
 
-// MARK REMINDER AS FIRED (used by scheduler)
+// MARK REMINDER AS FIRED — atomic guard prevents double-fire.
+// Uses findOneAndUpdate with status:"pending" condition so a second concurrent
+// scheduler tick (e.g. after a crash-restart) cannot fire the same reminder twice.
+// Returns null if the reminder was already fired/cancelled/delivered.
 const fireReminder = async (reminderId) => {
-  return await Reminder.findByIdAndUpdate(
-    reminderId,
+  return await Reminder.findOneAndUpdate(
+    { _id: reminderId, status: "pending" },  // atomic: only fires if still pending
     { status: "fired" },
     { new: true }
   );
 };
 
 
+// MARK REMINDER AS DELIVERED — called after voice.py successfully pops and speaks it.
+// Transitions fired → delivered so the lifecycle is fully auditable in MongoDB.
+// No-op if already delivered (idempotent).
+const markDelivered = async (reminderId) => {
+  return await Reminder.findOneAndUpdate(
+    { _id: reminderId, status: "fired" },    // only advance if still in fired state
+    { status: "delivered" },
+    { new: true }
+  );
+};
+
+
 // GET ALL PENDING REMINDERS DUE NOW OR EARLIER (used by scheduler)
+// Limit to 50 to prevent runaway batch after extended offline period.
 const getDueReminders = async () => {
   return await Reminder.find({
     status: "pending",
     reminderTime: { $lte: new Date() }
-  }).populate("user", "name email");
+  })
+    .populate("user", "name email")
+    .limit(50);
 };
 
 
@@ -61,5 +79,6 @@ module.exports = {
   getReminders,
   cancelReminder,
   fireReminder,
+  markDelivered,
   getDueReminders
 };

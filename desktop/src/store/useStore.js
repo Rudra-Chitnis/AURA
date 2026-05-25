@@ -127,6 +127,58 @@ const useStore = create((set, get) => ({
     else   window.aura?.compactWindow();
   },
 
+  // ── Debug / Observability ──────────────────────────────────────────────
+  // Only populated when AURA_DEBUG=true.  Kept at max 50 events so the
+  // panel never grows unbounded.
+  debugEnabled: false,
+  debugState: {
+    intent:         null,   // last detected intent
+    mode:           null,   // last classifyQuery mode
+    memoriesCount:  null,   // last memory search result count
+    contextPairs:   null,   // last deduped history pairs count
+    ollamaState:    null,   // last Ollama event
+    firstTokenMs:   null,   // last first-token latency (ms)
+    sanitizerCount: 0,      // cumulative sanitizer triggers this session
+    retryCount:     0,      // cumulative retries this session
+    loopState:      null,   // last loop state (IDLE/LISTENING/THINKING/SPEAKING)
+  },
+  debugEvents: [],          // rolling 50-event log
+
+  setDebugEnabled: (b) => set({ debugEnabled: b }),
+
+  addDebugEvent: (evt) =>
+    set((s) => {
+      // Update live stat fields from the event
+      const patch = {};
+      const ds    = s.debugState;
+      switch (evt.type) {
+        case "intent":        patch.debugState = { ...ds, intent:        evt.resolved || evt.intent }; break;
+        case "mode":          patch.debugState = { ...ds, mode:          evt.selected }; break;
+        case "memory":        patch.debugState = { ...ds, memoriesCount: evt.count };   break;
+        case "memory_gate":   patch.debugState = { ...ds, memoriesCount: evt.gatePass ? (ds.memoriesCount ?? 0) : 0 }; break;
+        case "context":       patch.debugState = { ...ds, contextPairs:  evt.pairs };   break;
+        case "ollama":        patch.debugState = { ...ds, ollamaState:   evt.event };   break;
+        case "stream_event":
+          if (evt.event === "first-token" && evt.ms != null)
+            patch.debugState = { ...ds, firstTokenMs: evt.ms };
+          break;
+        case "sanitizer":     patch.debugState = { ...ds, sanitizerCount: (ds.sanitizerCount || 0) + (evt.count || 1) }; break;
+        case "retry":         patch.debugState = { ...ds, retryCount: (ds.retryCount || 0) + 1 }; break;
+        case "loop_state":    patch.debugState = { ...ds, loopState: evt.state }; break;
+        default: break;
+      }
+      return {
+        ...patch,
+        debugEvents: [evt, ...s.debugEvents].slice(0, 50),
+      };
+    }),
+
+  clearDebugEvents: () =>
+    set({ debugEvents: [], debugState: {
+      intent: null, mode: null, memoriesCount: null, contextPairs: null,
+      ollamaState: null, firstTokenMs: null, sanitizerCount: 0, retryCount: 0, loopState: null,
+    }}),
+
   // ── Settings ───────────────────────────────────────────────────────────
   settings: {
     backendUrl:      "http://localhost:5000",
@@ -139,8 +191,21 @@ const useStore = create((set, get) => ({
     autoStartVoice:  false,
   },
 
-  updateSettings: (patch) =>
-    set((s) => ({ settings: { ...s.settings, ...patch } })),
+  updateSettings: (patch) => {
+    set((s) => {
+      const next = { ...s.settings, ...patch };
+      // Persist to ~/.aura_settings via Electron IPC (best-effort)
+      window.aura?.saveSettings(next);
+      return { settings: next };
+    });
+  },
+
+  // Hydrate settings from disk on startup — called once in App.jsx
+  hydrateSettings: (saved) => {
+    if (saved && typeof saved === "object") {
+      set((s) => ({ settings: { ...s.settings, ...saved } }));
+    }
+  },
 }));
 
 export default useStore;

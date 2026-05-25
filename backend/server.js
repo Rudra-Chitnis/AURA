@@ -5,11 +5,12 @@ const cors = require("cors");
 const connectMongo = require("./config/mongo");
 const wsHub = require("./wsHub");
 
-const logRoute = require("./routes/logRoute");
-const authRoute = require("./routes/authRoute");
-const memoryRoute = require("./routes/memoryRoute");
-const aiRoutes = require("./routes/aiRoute");
-const reminderRoute = require("./routes/reminderRoute");
+const logRoute          = require("./routes/logRoute");
+const authRoute         = require("./routes/authRoute");
+const memoryRoute       = require("./routes/memoryRoute");
+const aiRoutes          = require("./routes/aiRoute");
+const reminderRoute     = require("./routes/reminderRoute");
+const conversationRoute = require("./routes/conversationRoute");
 
 const errorHandler = require("./middleware/errorHandler");
 const { startReminderScheduler, popFiredForUser } = require("./services/reminderScheduler");
@@ -32,11 +33,12 @@ connectMongo().then(async () => {
 app.use(cors());
 app.use(express.json());
 
-app.use("/api/log", logRoute);
-app.use("/api/auth", authRoute);
-app.use("/api/memory", memoryRoute);
-app.use("/api/ai", aiRoutes);
-app.use("/api/reminders", reminderRoute);
+app.use("/api/log",          logRoute);
+app.use("/api/auth",         authRoute);
+app.use("/api/memory",       memoryRoute);
+app.use("/api/ai",           aiRoutes);
+app.use("/api/reminders",    reminderRoute);
+app.use("/api/conversation", conversationRoute);
 
 // Voice client polls this every ~30s to check if any reminders fired
 app.get("/api/reminders/pending-voice", protect, (req, res) => {

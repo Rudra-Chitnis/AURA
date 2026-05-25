@@ -49,7 +49,7 @@ contextBridge.exposeInMainWorld("aura", {
 
   // ── startup phase ────────────────────────────────────────────────────────
   // Emitted by main.js as AURA boots: launching → starting-backend →
-  // loading-voice → warming-models → ready
+  // checking-ollama → loading-voice → warming-models → ready
   onStartupPhase: (cb)  => {
     ipcRenderer.on("startup-phase", (_, phase) => cb(phase));
     return () => ipcRenderer.removeAllListeners("startup-phase");
@@ -65,7 +65,69 @@ contextBridge.exposeInMainWorld("aura", {
     return () => ipcRenderer.removeAllListeners("backend-status");
   },
 
+  // ── ollama status ─────────────────────────────────────────────────────────
+  // "starting"      — server not yet responding
+  // "loading-model" — server up, required model not yet in /api/tags
+  // "running"       — server up, model confirmed available
+  // "unavailable"   — 6-minute timeout or binary not found
+  onOllamaStatus: (cb) => {
+    ipcRenderer.on("ollama-status", (_, val) => cb(val));
+    return () => ipcRenderer.removeAllListeners("ollama-status");
+  },
+
+  // ── settings persistence ──────────────────────────────────────────────────
+  // Settings stored in ~/.aura_settings — survive Electron restarts.
+  loadSettings: ()           => ipcRenderer.invoke("load-settings"),
+  saveSettings: (settings)   => ipcRenderer.invoke("save-settings", settings),
+
   // ── notifications ────────────────────────────────────────────────────────
   notify: ({ title, body }) =>
     ipcRenderer.send("show-notification", { title, body }),
+
+  // ── timers ────────────────────────────────────────────────────────────────
+  setTimer:    (label, seconds) => ipcRenderer.invoke("set-timer",    { label, seconds }),
+  cancelTimer: (id)             => ipcRenderer.invoke("cancel-timer", id),
+  listTimers:  ()               => ipcRenderer.invoke("list-timers"),
+  onTimerTick: (cb) => {
+    const handler = (_, timers) => cb(timers);
+    ipcRenderer.on("timer-tick", handler);
+    return () => ipcRenderer.removeListener("timer-tick", handler);
+  },
+  onTimerFired: (cb) => {
+    const handler = (_, data) => cb(data);
+    ipcRenderer.on("timer-fired", handler);
+    return () => ipcRenderer.removeListener("timer-fired", handler);
+  },
+
+  // ── desktop reminders ─────────────────────────────────────────────────────
+  setDesktopReminder:    (text, fireAt) => ipcRenderer.invoke("set-reminder",    { text, fireAt }),
+  cancelDesktopReminder: (id)           => ipcRenderer.invoke("cancel-reminder", id),
+  listDesktopReminders:  ()             => ipcRenderer.invoke("list-reminders"),
+  onReminderFired: (cb) => {
+    const handler = (_, data) => cb(data);
+    ipcRenderer.on("reminder-fired", handler);
+    return () => ipcRenderer.removeListener("reminder-fired", handler);
+  },
+  onReminderUpdated: (cb) => {
+    const handler = (_, reminders) => cb(reminders);
+    ipcRenderer.on("reminder-updated", handler);
+    return () => ipcRenderer.removeListener("reminder-updated", handler);
+  },
+
+  // ── wake voice from sleep ─────────────────────────────────────────────────
+  voiceWake: () => ipcRenderer.invoke("voice-wake"),
+
+  // ── debug mode / observability ────────────────────────────────────────────
+  // Returns true when AURA_DEBUG=true is set in the Electron environment.
+  // The renderer uses this to conditionally mount the DebugPanel overlay.
+  getDebugMode: () => ipcRenderer.invoke("get-debug-mode"),
+
+  // Subscribe to debug events forwarded from both Python (via stdout AURA:DEBUG:)
+  // and from the Node.js backend (via WebSocket debug:* messages relayed by App.jsx).
+  // Returns an unsubscribe function.
+  onDebugEvent: (cb) => {
+    const handler = (_, payload) => cb(payload);
+    ipcRenderer.on("debug-event", handler);
+    return () => ipcRenderer.removeListener("debug-event", handler);
+  },
 });

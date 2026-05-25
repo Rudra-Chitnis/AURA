@@ -38,13 +38,18 @@ const start = (port = 5001) => {
 };
 
 const broadcast = (event) => {
-  if (!wss) return;
+  if (!wss) return 0;
   const msg = typeof event === "string" ? event : JSON.stringify(event);
   let count = 0;
   wss.clients.forEach((client) => {
     if (client.readyState === 1 /* OPEN */) {
-      client.send(msg);
-      count++;
+      try {
+        client.send(msg);
+        count++;
+      } catch (err) {
+        // One broken client must not stop delivery to the rest
+        console.warn("[WS Hub] client.send() failed (client may have disconnected):", err.message);
+      }
     }
   });
   return count;

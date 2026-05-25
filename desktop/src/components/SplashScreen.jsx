@@ -3,9 +3,10 @@ import { useEffect, useRef, useState } from "react";
 // ── Phase metadata ─────────────────────────────────────────────────────────
 const PHASES = {
   "launching":        { label: "Launching",            pct: 5  },
-  "starting-backend": { label: "Starting services",    pct: 30 },
-  "loading-voice":    { label: "Loading voice engine", pct: 55 },
-  "warming-models":   { label: "Warming up AI models", pct: 78 },
+  "starting-backend": { label: "Starting services",    pct: 25 },
+  "checking-ollama":  { label: "Checking AI engine",   pct: 45 },
+  "loading-voice":    { label: "Loading voice engine", pct: 62 },
+  "warming-models":   { label: "Warming up AI models", pct: 82 },
   "connecting":       { label: "Connecting",           pct: 92 },
   "ready":            { label: "Ready",                pct: 100 },
 };
