@@ -11,6 +11,7 @@ const memoryRoute       = require("./routes/memoryRoute");
 const aiRoutes          = require("./routes/aiRoute");
 const reminderRoute     = require("./routes/reminderRoute");
 const conversationRoute = require("./routes/conversationRoute");
+const diagnosticsRoute  = require("./routes/diagnosticsRoute");
 
 const errorHandler = require("./middleware/errorHandler");
 const { startReminderScheduler, popFiredForUser } = require("./services/reminderScheduler");
@@ -39,6 +40,7 @@ app.use("/api/memory",       memoryRoute);
 app.use("/api/ai",           aiRoutes);
 app.use("/api/reminders",    reminderRoute);
 app.use("/api/conversation", conversationRoute);
+app.use("/api/diagnostics",  diagnosticsRoute);
 
 // Voice client polls this every ~30s to check if any reminders fired
 app.get("/api/reminders/pending-voice", protect, (req, res) => {
@@ -66,6 +68,20 @@ app.get("/api/health", (_req, res) => {
 // ── Real-time event push (no auth — localhost only, used by voice.py + Electron)
 app.post("/api/events/push", (req, res) => {
   const event = req.body;
+  if (event && event.type === "diagnostic") {
+    try {
+      const diagnostics = require("./services/runtimeDiagnosticsService");
+      const recorded = diagnostics.record({
+        ...event,
+        type: event.diagnosticType || event.diagnostic_type || "runtime_event",
+        source: event.source || "voice",
+        data: event.data || {},
+      });
+      return res.json({ ok: true, clients: 0, event: recorded });
+    } catch (_) {
+      // Event push is best-effort and must not block UI sync.
+    }
+  }
   const count = wsHub.broadcast(event);
   res.json({ ok: true, clients: count });
 });

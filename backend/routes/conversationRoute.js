@@ -2,6 +2,11 @@ const express  = require("express");
 const router   = express.Router();
 const protect  = require("../middleware/authMiddleware");
 const { saveHistory, loadHistory } = require("../services/conversationService");
+const {
+  sanitizeAssistantOutput,
+  isMalformedAssistantOutput,
+  isSpeakableFinalOutput,
+} = require("../services/aiService");
 
 
 // ─────────────────────────────────────────────
@@ -40,9 +45,23 @@ router.post("/history", protect, async (req, res, next) => {
     }
 
     // Validate each turn before writing — reject malformed entries
-    const valid = turns.filter(
+    const structurallyValid = turns.filter(
       t => t && (t.role === "user" || t.role === "assistant") && typeof t.content === "string" && t.content.trim()
     );
+
+    const valid = [];
+    for (const turn of structurallyValid) {
+      if (turn.role === "assistant") {
+        const clean = sanitizeAssistantOutput(turn.content);
+        if (!clean || isMalformedAssistantOutput(clean) || !isSpeakableFinalOutput(clean)) {
+          if (valid.length && valid[valid.length - 1].role === "user") valid.pop();
+          continue;
+        }
+        valid.push({ role: "assistant", content: clean });
+      } else {
+        valid.push({ role: "user", content: turn.content.trim() });
+      }
+    }
 
     if (valid.length === 0) {
       return res.status(400).json({ message: "no valid turns in request" });

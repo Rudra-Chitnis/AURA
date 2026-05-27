@@ -8,6 +8,8 @@ export default function useWebSocket() {
   const wsRef        = useRef(null);
   const retryRef     = useRef(null);
   const retryCount   = useRef(0);
+  const mountedRef   = useRef(false);
+  const lastVoiceRef = useRef({ userText: "", assistantText: "" });
 
   const {
     settings,
@@ -34,24 +36,30 @@ export default function useWebSocket() {
 
           // When voice picks up a transcript → add as user message in chat
           if (msg.state === "thinking" && msg.text) {
-            addMessage({
-              id:        `voice-user-${Date.now()}`,
-              role:      "user",
-              content:   msg.text,
-              timestamp: new Date().toISOString(),
-            });
+            if (lastVoiceRef.current.userText !== msg.text) {
+              lastVoiceRef.current.userText = msg.text;
+              addMessage({
+                id:        `voice-user-${Date.now()}`,
+                role:      "user",
+                content:   msg.text,
+                timestamp: new Date().toISOString(),
+              });
+            }
           }
 
           // When voice starts speaking → add AURA message + update display
           if (msg.state === "speaking" && msg.text) {
             setCurrentResponse(msg.text);
-            const id = `voice-aura-${Date.now()}`;
-            addMessage({
-              id,
-              role:      "assistant",
-              content:   msg.text,
-              timestamp: new Date().toISOString(),
-            });
+            if (lastVoiceRef.current.assistantText !== msg.text) {
+              lastVoiceRef.current.assistantText = msg.text;
+              const id = `voice-aura-${Date.now()}`;
+              addMessage({
+                id,
+                role:      "assistant",
+                content:   msg.text,
+                timestamp: new Date().toISOString(),
+              });
+            }
           }
 
           // When going idle → clear the response display
@@ -89,6 +97,15 @@ export default function useWebSocket() {
         // ── Debug events from Node.js backend (via wsHub broadcast) ──────
         // These are emitted by debugLogger.js _broadcast() calls.
         // Type prefix is "debug:" (e.g. "debug:mode", "debug:memory").
+        case "diagnostic": {
+          addDebugEvent({
+            ...msg,
+            type: msg.issue || "diagnostic",
+            source: msg.source || "runtime",
+          });
+          break;
+        }
+
         default:
           if (msg.type && msg.type.startsWith("debug:")) {
             // Strip the "debug:" prefix so the store handler sees the plain type
@@ -118,6 +135,7 @@ export default function useWebSocket() {
 
       ws.onclose = () => {
         wsRef.current = null;
+        if (!mountedRef.current) return;
         // Retry with backoff up to 30s
         const delay = Math.min(1000 * Math.pow(1.6, retryCount.current), 30000);
         retryCount.current++;
@@ -133,8 +151,10 @@ export default function useWebSocket() {
   }, [settings.wsUrl, handleEvent]);
 
   useEffect(() => {
+    mountedRef.current = true;
     connect();
     return () => {
+      mountedRef.current = false;
       clearTimeout(retryRef.current);
       wsRef.current?.close();
     };

@@ -111,7 +111,13 @@ const parseStructuredMemory = (raw) => {
   if (m) return { person: "user", attribute: `favorite_${m[1].trim()}`, value: m[2].trim(), confidence: "high" };
 
   // ── RELATIONSHIPS ─────────────────────────────────────────────────────────
-  m = text.match(/^([a-z]+)\s+is\s+my\s+(.+)$/);
+  // Matches: "Sadgi is my friend", "Sadgi Garg is my close friend", etc.
+  // The previous pattern used ^([a-z]+) which only matched a single word before
+  // "is my", causing "Sadgi Garg is my friend" to fail and be stored as
+  // unstructured plain text — losing the person field and therefore all
+  // personBoost benefits in future searchMemory calls.
+  // The new pattern allows 1-4 words (name with optional surname) before "is my".
+  m = text.match(/^([\w]+(?:\s+[\w]+){0,3})\s+is\s+my\s+(.+)$/);
   if (m) return { person: m[1].trim(), attribute: "relationship_to_user", value: m[2].trim(), confidence: "high" };
 
   // ── GENERIC "my X is Y" catch-all (medium confidence) ────────────────────

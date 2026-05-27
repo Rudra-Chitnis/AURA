@@ -1,5 +1,20 @@
 import { create } from "zustand";
 
+const ASSISTANT_SCAFFOLD_RE = /(?:^(?:assistant|aura|output|narration|recent\s+conversation|question|user|human)\s*:\s*\S|^\[(?:user|human|you|assistant|aura)\]\s*:\s*\S|use\s+these\s+private\s+facts|use\s+this\s+recent\s+context|private\s+facts\s+only\s+when\s+relevant|recent\s+context\s+only\s+when\s+it\s+helps|the\s+user\s+asks\s*:|your\s+answer\s*:|here'?s?\s+(?:an?\s+)?example\s+(?:response|answer|reply)|questions?\s+and\s+answers?\s+for\s+you\s+to\s+practice|sample\s+(?:response|answer|question)|practice\s+question)/im;
+const ASSISTANT_LABEL_RE = /^(?:\[(?:user|human|you|assistant|aura)\]|answer|response|spoken\s*response|output|narration|aura\w*|assistant|ai|bot|[qa]|personal|general|opinion|mixed|action)\s*:\s*/i;
+
+const cleanAssistantMessage = (text) => {
+  const cleaned = (text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(" ")
+    .replace(ASSISTANT_LABEL_RE, "")
+    .trim();
+  if (!cleaned || ASSISTANT_SCAFFOLD_RE.test(cleaned) || !/[A-Za-z]/.test(cleaned)) return "";
+  return cleaned;
+};
+
 const useStore = create((set, get) => ({
   // ── Auth ───────────────────────────────────────────────────────────────
   token:           null,
@@ -57,9 +72,13 @@ const useStore = create((set, get) => ({
     set((s) => ({
       isStreaming:  false,
       streamingId:  null,
-      messages:     s.messages.map((m) =>
-        m.id === s.streamingId ? { ...m, streaming: false } : m
-      ),
+      messages:     s.messages
+        .map((m) => {
+          if (m.id !== s.streamingId) return m;
+          const content = cleanAssistantMessage(m.content);
+          return content ? { ...m, content, streaming: false } : null;
+        })
+        .filter(Boolean),
     })),
 
   clearMessages: () =>

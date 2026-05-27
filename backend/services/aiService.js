@@ -22,6 +22,23 @@ const OLLAMA_MODEL_FAST = process.env.OLLAMA_MODEL_FAST || process.env.OLLAMA_MO
 // ─────────────────────────────────────────────
 const FIRST_TOKEN_MS = 12_000;   // 12 s — model must start within this window
 const TOKEN_GAP_MS   = 20_000;   // 20 s — max silence between chunks mid-stream
+const STOP_SEQUENCES = [
+  "\nUser:",
+  "\nAssistant:",
+  "\nAURA:",
+  "\n[user]:",
+  "\n[aura]:",
+  "\nOutput:",
+  "\nNarration:",
+  "\nRecent conversation:",
+  "\nThe user asks:",
+  "\nYour answer:",
+  "\nUse these private facts",
+  "\nUse this recent context",
+  "\nKnown facts",
+  "\nRecent user topics",
+  "\nCurrent time",
+];
 
 /**
  * Destroy a Node.js Readable stream with a named error.
@@ -32,6 +49,41 @@ const _killStream = (stream, msg, code) => {
   const err  = new Error(msg);
   err.code   = code;
   stream.destroy(err);
+};
+
+const _OUTPUT_LABEL_RE = /^(?:\[(?:user|human|you|assistant|aura)\]|answer|response|spoken\s*response|output|narration|aura\w*|assistant|ai|bot|[qa]|personal|general|opinion|mixed|action)\s*:\s*/i;
+const _OUTPUT_OPENER_RE = /^(?:sure\s+thing[!.]?|sure[!.]?|certainly[!.]?|of\s+course[!.]?|absolutely[!.]?|great[!.]?|got\s+it[!.]?|ok(?:ay)?[!.]?|no\s+problem[!.]?|happy\s+to\s+help[!.]?|that'?s\s+a\s+(?:great|good)\s+question[!.]?|i\s+can\s+help\s+(?:you\s+)?(?:with\s+that)?[!.]?)\s*/i;
+const _OUTPUT_SCAFFOLD_RE = /(?:^(?:assistant|aura|output|narration|recent\s+conversation|question|user|human|facts|preference|topic)\s*:\s*\S|^about\s+[a-z][a-z0-9 .'-]{1,40}\.$|^\[(?:user|human|you|assistant|aura)\]\s*:\s*\S|short\s+natural\s+answer|natural\s+spoken\s+answer|no\s+lists|no\s+labels|fresh\s+answer|only\s+those\s+facts|no\s+saved\s+facts|if\s+missing|use\s+these\s+private\s+facts|use\s+this\s+recent\s+context|draw\s+on\s+what\s+you\s+know|given\s+the\s+context|possible\s+response|private\s+facts\s+only\s+when\s+relevant|recent\s+context\s+only\s+when\s+it\s+helps|known\s+facts\s+-|recent\s+user\s+topics\s+-|the\s+user\s+asks\s*:|your\s+answer\s*:|here'?s?\s+(?:an?\s+)?example\s+(?:response|answer|reply)|questions?\s+and\s+answers?\s+for\s+you\s+to\s+practice|sample\s+(?:response|answer|question)|practice\s+question|(?:you\s+might|you\s+could)\s+say[:\s]|here'?s?\s+how\s+you\s+(?:could|might|would|should)\s+(?:answer|respond|reply))/im;
+const _OUTPUT_MALFORMED_RE = /(?:opening\s+(?:spotify|youtube|amazon|chrome|browser|whatsapp|maps|notepad|calculator)|playing\s+.{1,60}on\s+spotify|searching\s+(?:amazon|youtube|google)\s+for\b|timer\s+set\s+for\b|reminder\s+set\s+for\b|got\s+it,?\s+i'?ll\s+remember\s+that|here'?s\s+a\s+revised\s+version|revised\s+version\s+of\s+the\s+conversation|based\s+on\s+(?:the\s+)?(?:given\s+|above\s+)?conversation|as\s+an?\s+ai(?:\s+(?:assistant|language\s+model|system))?\b|i\s+(?:am|'?m)\s+an?\s+ai(?:\s+(?:assistant|language\s+model))?\b|i\s+cannot\s+(?:access|retrieve|read|see)\s+(?:the\s+)?(?:user|your\s+personal)|i\s+don'?t\s+have\s+(?:the\s+ability|access)\s+to\s+(?:access|retrieve|read)|(?:the\s+)?(?:user|human)\s+(?:has\s+(?:not\s+)?(?:mentioned|provided|given|shared)|asked\s+(?:me\s+)?(?:to|about))|i\s+didn'?t\s+(?:quite\s+)?catch\s+that|that\s+sounds\s+tough\.?|i'?m\s+having\s+trouble\s+thinking\s+right\s+now|something\s+went\s+wrong\s+on\s+my\s+end)/i;
+
+const sanitizeAssistantOutput = (text) => {
+  if (!text || typeof text !== "string") return "";
+  const kept = text
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(l => l && !_HIST_LEAK_RE.test(l));
+  let result = kept.join(" ").trim();
+  result = result.replace(_OUTPUT_LABEL_RE, "").trim();
+  result = result.replace(_OUTPUT_OPENER_RE, "").trim();
+  return result;
+};
+
+const isMalformedAssistantOutput = (text) => {
+  const t = (text || "").trim();
+  if (!t) return true;
+  if (!/[A-Za-z]/.test(t)) return true;
+  return _OUTPUT_SCAFFOLD_RE.test(t) || _OUTPUT_MALFORMED_RE.test(t);
+};
+
+const isSpeakableFinalOutput = (text) => {
+  const t = (text || "").trim();
+  if (isMalformedAssistantOutput(t)) return false;
+  if (/^[,;:\)\]\}]+/.test(t)) return false;
+  const words = t.match(/[A-Za-z][A-Za-z']*/g) || [];
+  if (words.length < 3) {
+    return /^(?:yes|no|okay|ok|sure|maybe|nope|yep|thanks|not sure|it depends)\.?$/i.test(t);
+  }
+  return /[.!?]$/.test(t);
 };
 
 // Route heavy personal/mixed queries to the full model; fast model for everything else.
@@ -142,8 +194,25 @@ const detectIdentityEntities = (query) => {
 // not a local action, this instruction is always wrong and produces garbage.
 // ─────────────────────────────────────────────
 const PERSONAL_QUERY_RE = /\b(my |i am|who am i|where do i|what do i|do i |am i |when is my|what'?s my|what is my|tell me about me)\b/i;
-const GENERAL_QUERY_RE  = /\b(what is|what are|who is|who was|when did|how do|how does|explain|tell me about|why does|where is|define)\b/i;
+// GENERAL_QUERY_RE covers two classes of pattern:
+//   1. Formal question openers:  "what is", "how does", "explain", etc.
+//   2. Conversational speech patterns that voice users naturally produce but
+//      that old narrow regex missed, causing them to fall to the unclassified
+//      "general (fallback)" path with no TYPE_INSTRUCTIONS and no model signal.
+//
+// The conversational additions ("talk about", "let's discuss", "i want to know",
+// "i'm curious", etc.) capture the majority of open-ended speech-style queries
+// without touching action routing (detect_intent already handled those) or
+// personal queries (PERSONAL_QUERY_RE / CANONICAL_ENTITIES fire first).
+//
+// "what do you know about" is intentionally included: for non-canonical-entity
+// queries ("what do you know about smartwatches") this correctly routes as
+// "general". For canonical entities ("what do you know about Rudra") the
+// canonical entity check at step 1 fires first and returns "personal" —
+// GENERAL_QUERY_RE is never reached.
+const GENERAL_QUERY_RE  = /\b(what is|what are|who is|who was|when did|how do|how does|explain|tell me about|why does|where is|define|talk (?:to me )?about|tell me (?:how|why|when|where)|let'?s? (?:talk|discuss|chat)(?: about)?|i want to (?:know|learn|understand|hear)(?: (?:about|more about))?|i'?m curious(?: about)?|discuss|give me (?:some |an? )?(?:info|details?|overview|summary|rundown)(?: (?:about|on))?|help me understand|what (?:do you know|can you tell me) about)\b/i;
 const OPINION_QUERY_RE  = /\b(what do you think|your opinion|should i|would you recommend|which is better|what'?s better|do you think|in your view|your thoughts|advise me|is it worth)\b/i;
+const SELF_REFERENCE_RE = /\b(i|me|my|mine|myself|about me|who am i|what do you know about me|remember about me)\b/i;
 
 // AURA self-identity patterns — routes to personal so the identity-aware prompt branch
 // applies. "Who created you?" / "Do you have feelings?" etc.  These answers are
@@ -201,11 +270,39 @@ const classifyQuery = (query, memories) => {
   }
 
   // ── 6. MEMORY FALLBACK ────────────────────────────────────────────────────
-  // If memory search already ran and found results, the question has personal
-  // context — treat as personal so the LLM uses those facts.
-  if (memories && memories.length > 0) {
-    try { dbg.mode("personal", ["memories-fallback"], ["general"]); } catch (_) {}
-    return "personal";
+  // If memory search already ran and found results with sufficient confidence,
+  // the question has personal context — treat as personal so the LLM uses those facts.
+  //
+  // Threshold: score >= 0.45 (not just > 0).  searchMemory's base threshold is 0.35,
+  // meaning a memory scoring 0.35-0.44 can pass the search gate but represents weak
+  // semantic overlap — often just recencyBoost (0.05) carrying it over the line.
+  // A score this low indicates incidental domain adjacency, not genuine personal
+  // relevance.  Reclassifying as "personal" for such a result would constrain the LLM
+  // to answer "only from facts shown" for a question where those facts don't apply,
+  // producing bizarre or unhelpful responses.
+  //
+  // Score >= 0.45 ensures only genuinely relevant memories trigger the personal branch.
+  // ownerRef queries already use the 0.25 threshold in searchMemory and score higher
+  // due to personBoost (+0.20), so they comfortably exceed 0.45 — this gate doesn't
+  // suppress legitimate personal queries.
+  //
+  // MIXED ROUTING: if the query ALSO matches GENERAL_QUERY_RE (e.g. "tell me about India"
+  // with a personal India-related memory), route as "mixed" rather than "personal".
+  // TYPE_INSTRUCTIONS.personal ("Answer ONLY from facts") is too prohibitive for queries
+  // that are partly encyclopedic — the LLM either ignores the instruction (producing
+  // unconstrained output) or over-complies (producing 1-sentence personal-only answers).
+  // TYPE_INSTRUCTIONS.mixed ("use facts for personal part, general knowledge for rest")
+  // produces coherent responses that blend both dimensions correctly.
+  const hasExplicitPersonalSignal =
+    PERSONAL_QUERY_RE.test(q) ||
+    SELF_REFERENCE_RE.test(q) ||
+    detectIdentityEntities(query).isIdentity ||
+    /\babout me\b|\bknow (about )?me\b|\bwho am i\b|\bremember about me\b/i.test(q);
+
+  if (memories && hasExplicitPersonalSignal && memories.some(m => (m.score || 0) >= 0.45)) {
+    const routeType = GENERAL_QUERY_RE.test(q) ? "mixed" : "personal";
+    try { dbg.mode(routeType, ["memories-fallback", `score>=${(memories.find(m=>(m.score||0)>=0.45)||{}).score?.toFixed(2)}`, GENERAL_QUERY_RE.test(q) ? "general-re-also-matched" : "personal-only"], ["general"]); } catch (_) {}
+    return routeType;
   }
 
   try { dbg.mode("general", ["fallback-no-signals"]); } catch (_) {}
@@ -233,12 +330,21 @@ const classifyQuery = (query, memories) => {
 //   regardless of how it entered the stored history.
 //
 // Kept conservative: drops only confirmed structural contamination.
-// Falls back to original content if all lines are structural — never injects
-// an empty assistant turn (which could confuse the model more than a label).
+// Drops assistant content if all lines are structural — never resurrects
+// the original contaminated text as a future behavioral example.
 // ─────────────────────────────────────────────
-const _HIST_LABEL_RE  = /^(?:answer|response|spoken\s*response|aura\w*|assistant|ai|bot|[qa]|personal|general|opinion|mixed|action)\s*:\s*/i;
+const _HIST_LABEL_RE  = /^(?:\[(?:user|human|you|assistant|aura)\]|answer|response|spoken\s*response|output|narration|aura\w*|assistant|ai|bot|[qa]|personal|general|opinion|mixed|action)\s*:\s*/i;
 const _HIST_OPENER_RE = /^(?:sure\s+thing[!.]?|sure[!.]?|certainly[!.]?|of\s+course[!.]?|absolutely[!.]?|great[!.]?|got\s+it[!.]?|ok(?:ay)?[!.]?|no\s+problem[!.]?|happy\s+to\s+help[!.]?|that'?s\s+a\s+(?:great|good)\s+question[!.]?|i\s+can\s+help\s+(?:you\s+)?(?:with\s+that)?[!.]?)\s*/i;
-const _HIST_LEAK_RE   = /^(?:(?:user|human|you)\s*:|query\s*type|thinking\s*step|recent\s*conversation|your\s*last\s*responses|spoken\s*response\s*:|what\s*you\s*know\s*about\s*the\s*user|question\s*:|context\s*:|instructions?\s*:|memory\s*:|facts?\s*:|route\s*[-:—]|here'?s\s+a\s+revised|revised\s+version\s+of|conversation\s*:|summary\s*:|recap\s*:|aura\s+said|you\s+said\s*:|i\s+said\s*:)/i;
+const _HIST_LEAK_RE   = /^(?:(?:user|human|you|assistant|aura)\s*:|\[(?:user|human|you|assistant|aura)\]\s*:|output\s*:|narration\s*:|query\s*type|thinking\s*step|recent\s*conversation|your\s*last\s*responses|spoken\s*response\s*:|what\s*you\s*know\s*about\s*the\s*user|question\s*:|context\s*:|instructions?\s*:|memory\s*:|facts?\s*:|route\s*[-:—]|here'?s\s+a\s+revised|revised\s+version\s+of|conversation\s*:|summary\s*:|recap\s*:|aura\s+said|you\s+said\s*:|i\s+said\s*:)/i;
+
+// Prose-level contamination guard — mirrors voice.py _MALFORMED_RESPONSE_RE prose section.
+// Applied to the FULL turn content (not per-line) inside sanitizeHistoryContent.
+// These phrases are semantically well-formed prose so they pass all line-start filters,
+// but they encode LLM identity drift, transcript analysis, or context-collapse and must
+// never be fed back as behavioral examples in a future prompt's history block.
+// Also includes exact non-conversational system artifact strings (clarify responses,
+// error messages, empathize pre-speaks) that may exist in pre-fix MongoDB sessions.
+const _HIST_PROSE_RE  = /i\s+don'?t\s+have\s+(?:access\s+to|information\s+about)\s+the\s+user'?s?|based\s+on\s+(?:the\s+)?(?:given\s+|above\s+)?conversation|questions?\s+and\s+answers?\s+for\s+you\s+to\s+practice|here'?s?\s+(?:an?\s+)?example\s+(?:response|answer|reply)|as\s+an?\s+ai(?:\s+(?:assistant|language\s+model|system))?\b|i\s+(?:am|m)\s+an?\s+ai(?:\s+(?:assistant|language\s+model))?\b|i\s+cannot\s+(?:access|retrieve|read|see)\s+(?:the\s+)?(?:user|your\s+personal)|i\s+don'?t\s+have\s+(?:the\s+ability|access)\s+to\s+(?:access|retrieve|read)|(?:the\s+)?(?:user|human)\s+(?:has\s+(?:not\s+)?(?:mentioned|provided|given|shared)|asked\s+(?:me\s+)?(?:to|about))|i\s+didn'?t\s+(?:quite\s+)?catch\s+that|that\s+sounds\s+tough\.?|i'?m\s+having\s+trouble\s+thinking\s+right\s+now|something\s+went\s+wrong\s+on\s+my\s+end/i;
 
 // Action-confirmation strings that should never appear in conversational history.
 // These are exact outputs from voice.py action branches — deterministic, short, and safe
@@ -272,6 +378,15 @@ const sanitizeHistoryContent = (content) => {
         hits.forEach(h => dbg.contamination(h.type, h.match, 'history-assistant-turn'));
       }
     } catch (_) {}
+    return null;
+  }
+
+  // Prose contamination guard: full-turn scan for identity-drift / transcript-analysis
+  // phrases that are syntactically valid prose but behaviorally malformed.  These pass
+  // the per-line _HIST_LEAK_RE check but must never re-enter the prompt as examples.
+  // Mirrors the voice.py _MALFORMED_RESPONSE_RE prose section.
+  if (_HIST_PROSE_RE.test(trimmed)) {
+    try { if (dbg.DEBUG) dbg.historyFilter({ role: 'assistant', content }, 'DROP', 'prose-contamination pattern'); } catch (_) {}
     return null;
   }
 
@@ -357,21 +472,21 @@ const extractTopicsFromHistory = (history) => {
 // Falls back to raw content for unstructured memories.
 const formatMemory = (m) => {
   if (m.person && m.attribute && m.value) {
-    const subject = (m.person === "user") ? "You" : m.person;
+    const subject = (m.person === "user") ? "user" : m.person;
     switch (m.attribute) {
-      case "name":                 return `Your name is ${m.value}.`;
-      case "lives_in":             return `${subject} live${m.person === "user" ? "" : "s"} in ${m.value}.`;
-      case "works_at":             return `${subject} work${m.person === "user" ? "" : "s"} at ${m.value}.`;
-      case "studies_at":           return `${subject} stud${m.person === "user" ? "y" : "ies"} at ${m.value}.`;
-      case "occupation":           return `${subject} ${m.person === "user" ? "are" : "is"} a ${m.value}.`;
-      case "likes":                return `${subject} like${m.person === "user" ? "" : "s"} ${m.value}.`;
-      case "dislikes":             return `${subject} dislike${m.person === "user" ? "" : "s"} ${m.value}.`;
-      case "birthday":             return `${subject} birthday is ${m.value}.`;
-      case "relationship_to_user": return `${subject} is your ${m.value}.`;
+      case "name":                 return `user name=${m.value}`;
+      case "lives_in":             return `${subject} lives_in=${m.value}`;
+      case "works_at":             return `${subject} works_at=${m.value}`;
+      case "studies_at":           return `${subject} studies_at=${m.value}`;
+      case "occupation":           return `${subject} occupation=${m.value}`;
+      case "likes":                return `${subject} likes=${m.value}`;
+      case "dislikes":             return `${subject} dislikes=${m.value}`;
+      case "birthday":             return `${subject} birthday=${m.value}`;
+      case "relationship_to_user": return `${subject} relationship=${m.value}`;
       default:
         if (m.attribute.startsWith("favorite_"))
-          return `${subject} favorite ${m.attribute.replace("favorite_", "")} is ${m.value}.`;
-        return `${subject}: ${m.attribute} = ${m.value}.`;
+          return `${subject} favorite_${m.attribute.replace("favorite_", "")}=${m.value}`;
+        return `${subject} ${m.attribute}=${m.value}`;
     }
   }
   return m.content;
@@ -385,144 +500,91 @@ const formatMemory = (m) => {
 // real action commands before the LLM is called.  Any query that reaches here is
 // a conversational turn, never a local action.
 const TYPE_INSTRUCTIONS = {
-  personal: "Answer using only the facts shown under 'What you know about the user' above. If a specific fact is not listed, say you don't have that record. Do not add biographical details, speculation, or world knowledge.",
-  general:  "Answer from general knowledge. If uncertain, say you're not sure.",
-  opinion:  "Give a measured perspective. Draw on what you know about the user if it's relevant.",
-  mixed:    "Use the known user facts for the personal part of the answer, and general knowledge for the rest.",
+  personal: "facts-only",
+  general:  "plain",
+  opinion:  "opinion",
+  mixed:    "blend",
 };
 
-const buildPrompt = (query, memories, time_context, history = []) => {
-  const queryType    = classifyQuery(query, memories);
-  const identityCtx  = detectIdentityEntities(query);
-  const memoryText   = memories.length > 0
-    ? memories.map(m => `- ${formatMemory(m)}`).join("\n")
-    : "NONE";
+const FOLLOWUP_RE = /\b(that|this|it|they|them|he|she|her|him|those|these|same|there)\b|^(?:and|also|what about|how about|why|how so|tell me more)\b/i;
 
-  // ── IDENTITY GUARD ────────────────────────────────────────────────────────
-  // Injected only when the query references a canonical identity entity
-  // (owner name, known relationship, etc.).
-  //
-  // Two cases:
-  //   memories > 0 — personal facts are known; block any public-knowledge
-  //                  supplementation to prevent hallucination/contamination.
-  //   memories = 0 — no records yet; explicitly block guessing and direct
-  //                  LLM to admit uncertainty rather than fill gaps with
-  //                  public figures who share the name.
-  //
-  // Not injected for general queries — would waste tokens and confuse small models.
-  let identityGuard = "";
-  if (identityCtx.isIdentity) {
-    if (memories.length > 0) {
-      identityGuard = "\nCRITICAL: These facts are about a real person you personally know. Use ONLY the facts listed above. Do NOT supplement with public knowledge, biographical speculation, career information, or any detail not in the listed facts. If asked for something not listed, say you don't have that record.";
+const compactMemoryText = (memories, limit = 4) =>
+  memories
+    .filter(m => (m.score || 0) >= 0.62 || m.person || m.attribute)
+    .slice(0, limit)
+    .map(formatMemory)
+    .filter(Boolean)
+    .join("; ");
+
+const lastUserTopic = (history = []) => {
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i]?.role === "user" && history[i].content) {
+      return history[i].content.trim();
+    }
+  }
+  return "";
+};
+
+const buildPromptCompact = (query, memories, time_context, history = [], correctionOccurred = false, runtimeContext = null) => {
+  const queryType   = runtimeContext?.queryType || classifyQuery(query, memories);
+  const identityCtx = detectIdentityEntities(query);
+  const mode        = TYPE_INSTRUCTIONS[queryType] || TYPE_INSTRUCTIONS.general;
+  const facts       = compactMemoryText(memories, queryType === "personal" ? 6 : 2);
+  const priorTopic  = runtimeContext?.promptContext?.line ? "" : (FOLLOWUP_RE.test(query) ? lastUserTopic(history) : "");
+  const topics      = isSummaryRequest(query) ? extractTopicsFromHistory(history) : "";
+  const lines       = ["AURA. Short natural answer."];
+
+  if (correctionOccurred) lines.push("Fresh answer.");
+  if (runtimeContext?.promptContext?.line) lines.push(runtimeContext.promptContext.line);
+  if (topics) lines.push(`Summarize: ${topics.replace(/\s+/g, " ")}`);
+  else if (priorTopic) lines.push(`Earlier: ${priorTopic}`);
+
+  if (queryType === "personal") {
+    if (facts) {
+      lines.push(`Facts: ${facts}`);
+      if (identityCtx.isIdentity) lines.push("Only those facts for that person.");
     } else {
-      identityGuard = "\nCRITICAL: You have no stored records about this person yet. Do NOT use public knowledge, make biographical guesses, or assume details about people with this name. Say you don't have detailed information about them yet and invite the user to share what you should know.";
+      lines.push("No saved facts.");
     }
+  } else if (queryType === "mixed") {
+    if (facts) lines.push(`Facts: ${facts}`);
+  } else if (queryType === "opinion") {
+    const preferenceFacts = compactMemoryText(
+      memories.filter(m =>
+        (m.score || 0) >= 0.68 ||
+        ["likes", "dislikes", "favorite"].some(k => String(m.attribute || "").includes(k))
+      ),
+      1
+    );
+    if (preferenceFacts) lines.push(`Preference: ${preferenceFacts}`);
   }
 
-  const timeLine = time_context ? `Time: ${time_context}` : "";
+  if (mode === "facts-only") lines.push("If missing, say you do not have that saved.");
 
-  // Last 6 entries = 3 Q+A pairs — enough for follow-up context, fewer tokens.
-  // History is processed in three passes before injection:
-  //   1. Sanitize assistant turns — drop action confirmations, structural garbage
-  //      (sanitizeHistoryContent returns null → that turn is excluded entirely)
-  //   2. Drop orphaned user turns — if the paired assistant turn was dropped,
-  //      the user question alone adds noise without a clean answer to anchor it
-  //   3. Deduplicate — skip assistant turns whose cleaned content is identical
-  //      to the previous assistant turn (model loop / repeated output)
-  const recentHistory = history.slice(-6);
+  const prompt = `${lines.join("\n")}\n\n${query}\nAURA:`;
 
-  // Pass 1+2: sanitize assistant turns and pair-filter orphaned user entries.
-  // Build an indexed list of (userTurn, assistantTurn) pairs, keeping only clean pairs.
-  const cleanPairs = [];
-  for (let i = 0; i < recentHistory.length - 1; i += 2) {
-    const uTurn = recentHistory[i];
-    const aTurn = recentHistory[i + 1];
-    // Tolerate history arrays that don't align perfectly to user/assistant pairs
-    if (!uTurn || !aTurn) continue;
-    if (uTurn.role !== "user" || aTurn.role !== "assistant") continue;
-    const cleanAssistant = sanitizeHistoryContent(aTurn.content);
-    if (!cleanAssistant) continue;  // action turn or garbage — drop entire pair
-    cleanPairs.push({ user: uTurn.content, assistant: cleanAssistant });
-  }
-
-  // Pass 3: deduplicate — remove consecutive pairs with identical assistant content.
-  const dedupedPairs = cleanPairs.filter((pair, idx) =>
-    idx === 0 || pair.assistant.toLowerCase().trim() !== cleanPairs[idx - 1].assistant.toLowerCase().trim()
-  );
-
-  // Trace context window assembly: raw history depth, clean pairs, dropped pairs
   try {
-    if (dbg.DEBUG) {
-      const droppedPairs = (recentHistory.length / 2) - dedupedPairs.length;
-      dbg.contextWindow(recentHistory.length, dedupedPairs.length, droppedPairs);
-    }
-  } catch (_) {}
-
-  const historyText = dedupedPairs.length > 0
-    ? dedupedPairs
-        .map(p => `User: ${p.user}\nAssistant: ${p.assistant}`)
-        .join("\n")
-    : "None";
-
-  // Summary path: inject pre-extracted topic categories instead of asking the LLM
-  // to scan raw history (which small models do poorly).
-  let summaryInstruction = "";
-  if (isSummaryRequest(query)) {
-    const topics = extractTopicsFromHistory(history);
-    summaryInstruction = topics
-      ? `\nSUMMARY MODE — pre-extracted topics from this conversation:\n${topics}\nSpeak a 2–4 sentence summary of the above, grouped by category. Be specific.\n`
-      : `\nSUMMARY MODE: We haven't talked about anything yet. Say so.\n`;
-  }
-
-  const typeInstruction = TYPE_INSTRUCTIONS[queryType] || TYPE_INSTRUCTIONS.general;
-
-  const prompt = `You are AURA, a voice assistant. Output ONLY the spoken answer — no reasoning, no labels, no system text.
-${timeLine}
-
-What you know about the user:
-${memoryText}
-
-Recent conversation:
-${historyText}
-${summaryInstruction}
-${identityGuard}
-${typeInstruction}
-If your answer contradicts the recent conversation, correct it.
-Flag uncertainty with "I'm not certain."
-
-Write 1–3 short sentences — 5 to 12 words each. One idea per sentence.
-Use casual speech. Lead with the answer. Sound like a calm, smart friend.
-No labels, headers, bullets, or markdown. No meta-commentary. Just answer.
-Never say "I'm just an AI". You are AURA — speak as AURA.
-Example: "Yeah, cortisol is basically your stress hormone — it spikes under pressure."
-Example: "Jazz has a lot of texture — especially the improvisational side."
-Address the user as "you" and "your". Never say their name.
-"Who created you?" → "You did."
-"Do you have feelings?" → "Something like them."
-
-Question: ${query}
-
-Answer:`;
-
-  // Forensic prompt snapshot — written to debug/prompts/ when AURA_DEBUG=true.
-  // Records the full assembled prompt + metadata for offline inspection.
-  try {
-    if (dbg.DEBUG) dbg.promptSnapshot(queryType, identityCtx.isIdentity, prompt, memories.length, dedupedPairs.length);
+    if (dbg.DEBUG) dbg.promptSnapshot(queryType, identityCtx.isIdentity, prompt, memories.length, priorTopic ? 1 : 0);
   } catch (_) {}
 
   return prompt;
 };
 
+const buildPrompt = buildPromptCompact;
+
 // ─────────────────────────────────────────────
 // BLOCKING — used by /ask endpoint (fallback path)
 // ─────────────────────────────────────────────
-const generateResponse = async (query, memories, time_context, history = []) => {
-  const prompt     = buildPrompt(query, memories, time_context, history);
-  const queryType  = classifyQuery(query, memories);
+const generateResponse = async (query, memories, time_context, history = [], runtimeContext = null) => {
+  const queryType  = runtimeContext?.queryType || classifyQuery(query, memories);
+  const prompt     = buildPromptCompact(query, memories, time_context, history, false, runtimeContext);
   const model      = selectModel(queryType);
-  // personal/mixed need more tokens for nuanced memory-grounded answers;
-  // general/opinion responses are short by design
-  const maxTokens  = (queryType === "personal" || queryType === "mixed") ? 180 : 120;
+  // Align with generateResponseStream token budgets so blocking-fallback responses
+  // are never truncated relative to what the streaming path would produce.
+  // A truncated response stored in history looks like a complete answer to buildPrompt
+  // but may end mid-sentence, causing the next LLM call to "continue" it — stale
+  // continuation. Matching budgets eliminates this discrepancy.
+  const maxTokens  = (queryType === "personal") ? 220 : (queryType === "mixed") ? 300 : 280;
 
   const response = await axios.post(`${OLLAMA_HOST}/api/generate`, {
     model,
@@ -533,22 +595,24 @@ const generateResponse = async (query, memories, time_context, history = []) => 
       top_p:       0.9,
       num_predict: maxTokens,
       num_ctx:     4096,
+      stop:        STOP_SEQUENCES,
     }
   }, { timeout: 55000 });
 
-  return response.data.response.trim();
+  const cleaned = sanitizeAssistantOutput(response.data.response || "");
+  return isSpeakableFinalOutput(cleaned) ? cleaned : "";
 };
 
 // ─────────────────────────────────────────────
 // STREAMING — used by /ask-stream endpoint
 // ─────────────────────────────────────────────
-const generateResponseStream = async (query, memories, time_context, history = [], onToken) => {
-  const prompt    = buildPrompt(query, memories, time_context, history);
-  const queryType = classifyQuery(query, memories);
+const generateResponseStream = async (query, memories, time_context, history = [], onToken, correctionOccurred = false, runtimeContext = null) => {
+  const queryType = runtimeContext?.queryType || classifyQuery(query, memories);
+  const prompt    = buildPromptCompact(query, memories, time_context, history, correctionOccurred, runtimeContext);
   const model     = selectModel(queryType);
   // personal/mixed need more tokens for nuanced memory-grounded answers;
   // general/opinion responses are short by design
-  const maxTokens = (queryType === "personal" || queryType === "mixed") ? 180 : 120;
+  const maxTokens = (queryType === "personal") ? 220 : (queryType === "mixed") ? 300 : 280;
 
   try { if (dbg.DEBUG) dbg.ollamaEvent("stream-open", `model=${model}  queryType=${queryType}  maxTokens=${maxTokens}  mem=${memories.length}`); } catch (_) {}
 
@@ -565,6 +629,7 @@ const generateResponseStream = async (query, memories, time_context, history = [
         top_p:       0.9,
         num_predict: maxTokens,
         num_ctx:     4096,
+        stop:        STOP_SEQUENCES,
       }
     },
     { responseType: "stream", timeout: 55000 }
@@ -575,6 +640,36 @@ const generateResponseStream = async (query, memories, time_context, history = [
   let firstTokenTimeMs  = null;
   let tokenCount        = 0;
   let watchdog          = null;
+  let outputBuffer      = "";
+  let terminated        = false;
+
+  const emitCleanUnit = (unit, final = false) => {
+    const cleaned = sanitizeAssistantOutput(unit);
+    if (!cleaned) return true;
+    if (isMalformedAssistantOutput(cleaned)) {
+      terminated = true;
+      try { if (dbg.DEBUG) dbg.streamEvent("backend-scaffold-terminated", cleaned.slice(0, 100)); } catch (_) {}
+      return false;
+    }
+    if (final && !isSpeakableFinalOutput(cleaned)) {
+      try { if (dbg.DEBUG) dbg.streamEvent("backend-final-discarded", cleaned.slice(0, 100)); } catch (_) {}
+      return true;
+    }
+    onToken(cleaned + (/[.!?]$/.test(cleaned) ? " " : ""));
+    return true;
+  };
+
+  const flushCompleteUnits = () => {
+    while (!terminated) {
+      const match = outputBuffer.match(/[.!?](?:\s+|$)/);
+      if (!match) break;
+      const end = match.index + 1;
+      const unit = outputBuffer.slice(0, end).trim();
+      outputBuffer = outputBuffer.slice(match.index + match[0].length);
+      if (!emitCleanUnit(unit, false)) return false;
+    }
+    return true;
+  };
 
   // Arm the watchdog immediately after the stream opens.
   // Before first token:  FIRST_TOKEN_MS deadline.
@@ -617,26 +712,51 @@ const generateResponseStream = async (query, memories, time_context, history = [
 
         for (const line of lines) {
           if (!line.trim()) continue;
+          let data;
           try {
-            const data = JSON.parse(line);
-            if (data.response) {
-              tokenCount++;
-              onToken(data.response);
-            }
-            if (data.done) {
+            data = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (terminated) {
               clearTimeout(watchdog);
+              response.data.destroy();
+              resolve();
+              return;
+            }
+          if (data.response) {
+              tokenCount++;
+              outputBuffer += data.response;
+              if (_OUTPUT_SCAFFOLD_RE.test(outputBuffer)) {
+                terminated = true;
+                clearTimeout(watchdog);
+                response.data.destroy();
+                resolve();
+                return;
+              }
+              if (!flushCompleteUnits()) {
+                clearTimeout(watchdog);
+                response.data.destroy();
+                resolve();
+                return;
+              }
+            }
+          if (data.done) {
+              clearTimeout(watchdog);
+              if (outputBuffer.trim()) emitCleanUnit(outputBuffer, true);
+              outputBuffer = "";
               const totalMs = Date.now() - _streamStart;
               try { if (dbg.DEBUG) dbg.streamEvent("done", `tokens=${tokenCount}  model=${model}`, totalMs); } catch (_) {}
               resolve();
             }
-          } catch {
             // malformed JSON line — skip
-          }
         }
       });
 
       response.data.on("end", () => {
         clearTimeout(watchdog);
+        if (outputBuffer.trim()) emitCleanUnit(outputBuffer, true);
+        outputBuffer = "";
         try { if (dbg.DEBUG) dbg.streamEvent("end", `tokens=${tokenCount}  model=${model}`, Date.now() - _streamStart); } catch (_) {}
         resolve();
       });
@@ -657,7 +777,11 @@ module.exports = {
   generateResponse,
   generateResponseStream,
   isSummaryRequest,
+  buildPrompt,
   classifyQuery,
   detectIdentityEntities,
+  sanitizeAssistantOutput,
+  isMalformedAssistantOutput,
+  isSpeakableFinalOutput,
   OWNER_ENTITY_NAMES,
 };

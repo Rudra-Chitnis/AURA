@@ -42,18 +42,17 @@ export const register = (name, email, password) =>
 export const getProfile = () => apiFetch("/api/auth/profile");
 
 // ── AI — blocking ─────────────────────────────────────────────────────────
-export const ask = (query, history = []) =>
+export const ask = (query) =>
   apiFetch("/api/ai/ask", {
     method: "POST",
     body:   JSON.stringify({
       query,
-      history,
       time_context: new Date().toLocaleString(),
     }),
   });
 
 // ── AI — streaming SSE ────────────────────────────────────────────────────
-export const askStream = async (query, history = [], onToken, onDone) => {
+export const askStream = async (query, _history = [], onToken, onDone) => {
   const res = await fetch(`${_baseUrl}/api/ai/ask-stream`, {
     method:  "POST",
     headers: {
@@ -62,7 +61,6 @@ export const askStream = async (query, history = [], onToken, onDone) => {
     },
     body: JSON.stringify({
       query,
-      history,
       time_context: new Date().toLocaleString(),
     }),
   });

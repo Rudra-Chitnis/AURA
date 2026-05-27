@@ -45,8 +45,8 @@ MAX_TTS_CHARS = 600      # safety cap in case a single sentence is unusually lon
 
 # VAD recording
 VAD_THRESHOLD      = 300    # RMS energy — catches quieter speech
-VAD_SILENCE_CHUNKS = 18     # × 100 ms = 1.8 s silence → prevents mid-sentence cutoff
-VAD_MAX_DURATION   = 12
+VAD_SILENCE_CHUNKS = 25     # × 100 ms = 1.8 s silence → prevents mid-sentence cutoff
+VAD_MAX_DURATION   = 25
 
 # Whisper
 WHISPER_MODEL_SIZE = "small"
@@ -85,6 +85,11 @@ _should_quit        = threading.Event()  # set by QUIT stdin command; checked in
 # Short-term conversation memory — last 20 exchanges (10 Q+A pairs)
 _conversation_history: deque = deque(maxlen=20)
 _last_response: str = ""        # dedup guard: skip if identical to previous response
+_correction_just_occurred: bool = False  # set by correction handler, consumed by get_answer_stream
+_history_loaded_for_token: str | None = None
+_history_persist_q = _queue.Queue()
+_history_persist_worker_started = False
+_history_persist_lock = threading.Lock()
 
 # Stores the most recent open_app action so follow-up commands ("play it", "play the song")
 # can resume the same action without the user restating the full command.
@@ -228,6 +233,7 @@ def do_login():
         save_token(token)
         print("Login successful.\n")
         return token
+
     except requests.exceptions.ConnectionError:
         print(f"\nERROR: Cannot connect to backend at {BACKEND}")
         print("Make sure the backend is running: npm run dev")
@@ -377,6 +383,18 @@ def _event_sender_loop() -> None:
 def _push_event(event: dict) -> None:
     """Enqueue a JSON event for ordered delivery to the desktop UI."""
     _event_send_queue.put(event)
+
+
+def _push_diagnostic(event: dict) -> None:
+    """Send a structured runtime diagnostic without blocking the voice loop."""
+    event = event or {}
+    _push_event({
+        "type": "diagnostic",
+        "diagnosticType": event.get("type", "voice_runtime_event"),
+        "source": "voice",
+        "severity": event.get("severity", "info"),
+        "data": event.get("data", {}),
+    })
 
 
 # ─────────────────────────────────────────────
@@ -1159,7 +1177,10 @@ def _stop_all_playback():
 _LEAK_KEYWORDS = re.compile(
     r'^(?:'
     # Role labels — model echoing prompt structure
-    r'(?:user|human|you)\s*:'
+    r'(?:user|human|you|assistant|aura)\s*:'
+    r'|\[(?:user|human|you|assistant|aura)\]\s*:'
+    r'|output\s*:'
+    r'|narration\s*:'
     r'|query\s*type'
     r'|thinking\s*step'
     r'|recent\s*conversation'
@@ -1205,7 +1226,7 @@ _BULLET_LEAK_RE = re.compile(
 # Also covers query-type labels that small models echo from the prompt:
 # "Personal:", "General:", "Opinion:", "Mixed:", "Action:"
 _LEADING_LABEL_RE = re.compile(
-    r'^(?:answer|response|spoken\s*response|aura\w*|assistant|ai|bot|[qa]'
+    r'^(?:\[(?:user|human|you|assistant|aura)\]|answer|response|spoken\s*response|output|narration|aura\w*|assistant|ai|bot|[qa]'
     r'|personal|general|opinion|mixed|action'
     r')\s*:\s*',
     re.IGNORECASE
@@ -1264,9 +1285,63 @@ _MALFORMED_RESPONSE_RE = re.compile(
     r'|revised\s+version\s+of\s+the\s+conversation'
     r'|just\s+say\s+["‘’“”]'    # 'Just say "X"' action instruction
     r"|say\s+['\"]"                                  # 'Say "X"' action instruction
+    # Prose-level meta-commentary: semantically well-formed sentences that encode
+    # LLM identity drift, transcript analysis, or context-collapse.  These pass
+    # all line-start filters because they contain no label prefixes, yet they
+    # must never be stored as behavioral examples for subsequent turns.
+    r"|i\s+don'?t\s+have\s+(?:access\s+to|information\s+about)\s+the\s+user'?s?"
+    r'|based\s+on\s+(?:the\s+)?(?:given\s+|above\s+)?conversation'
+    r'|as\s+an?\s+ai(?:\s+(?:assistant|language\s+model|system))?\b'
+    r'|i\s+(?:am|m)\s+an?\s+ai(?:\s+(?:assistant|language\s+model))?\b'
+    r'|i\s+cannot\s+(?:access|retrieve|read|see)\s+(?:the\s+)?(?:user|your\s+personal)'
+    r"|i\s+don'?t\s+have\s+(?:the\s+ability|access)\s+to\s+(?:access|retrieve|read)"
+    r'|(?:the\s+)?(?:user|human)\s+(?:has\s+(?:not\s+)?(?:mentioned|provided|given|shared)|asked\s+(?:me\s+)?(?:to|about))'
+    # Non-conversational system artifacts: error messages, clarify responses, and
+    # empathize pre-speaks produced by voice.py itself.  These are exact hard-coded
+    # strings that are never valid LLM outputs and must never be stored as behavioral
+    # examples.  Matched as substrings (not anchored) so trailing punctuation variants
+    # ("I'm having trouble thinking right now. Try again in a moment.") are caught.
+    r"|i didn'?t\s+(?:quite\s+)?catch\s+that"
+    r'|that sounds tough\.?'
+    r"|i'?m having trouble thinking right now"
+    r'|something went wrong on my end'
+    # Auth-failure message yielded by get_answer_stream on a 401 response.
+    # Must not be stored as a behavioral example in history.
+    r'|i need to sign in again'
     r')',
     re.IGNORECASE,
 )
+
+# Sentence-level scaffold continuation detector.
+# Applied per-sentence in get_answer_stream BEFORE yielding to speak_stream.
+# Catches the model generating new examples, Q&A pairs, or role-continuation
+# from the prompt structure -- patterns that escape _clean_llm_output because
+# they are syntactically valid prose with no label prefix.
+#
+# Why sentence-level is required: _MALFORMED_RESPONSE_RE runs on the FULL
+# assembled response AFTER speak_stream returns -- too late to prevent the
+# scaffold sentence from being spoken.  This filter runs per-sentence before
+# TTS, so scaffold phrases are silently dropped before audio generation.
+_SCAFFOLD_LEAK_RE = re.compile(
+    r'(?:'
+    # Direct continuation of prompt/transcript scaffolding
+    r'^(?:assistant|aura|output|narration|recent\s+conversation)\s*:\s*\S'
+    r'|^\[(?:user|human|you|assistant|aura)\]\s*:\s*\S'
+    # Model generating new examples after the real answer
+    r"|here'?s?\s+(?:an?\s+)?example\s+(?:response|answer|reply)"
+    r'|here\s+(?:are\s+)?(?:some\s+)?(?:questions?\s+and\s+answers?|q&a|practice)'
+    r'|questions?\s+and\s+answers?\s+for\s+you\s+to\s+practice'
+    r'|sample\s+(?:response|answer|question)'
+    r'|practice\s+question'
+    # Model generating "you might say" meta-commentary
+    r'|(?:you\s+might|you\s+could)\s+say[:\s]'
+    r"|here'?s?\s+how\s+you\s+(?:could|might|would|should)\s+(?:answer|respond|reply)"
+    # Model continuing with a new User:/Question: prompt pair
+    r'|^(?:question|user|human|assistant|aura|output|narration)\s*:\s*\S'
+    r')',
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 def _is_malformed_response(text: str) -> bool:
     """
@@ -1277,6 +1352,38 @@ def _is_malformed_response(text: str) -> bool:
     example for subsequent turns.
     """
     return bool(_MALFORMED_RESPONSE_RE.search(text or ""))
+
+
+def _is_speakable_stream_chunk(text: str, *, final_fragment: bool = False) -> bool:
+    """
+    Final gate before streamed text reaches TTS.
+
+    Normal chunks must be valid, non-scaffold assistant prose. Final-buffer
+    leftovers are stricter so token tails like "softwa" or ", you!" are dropped.
+    """
+    if not _is_valid_response(text):
+        return False
+    if _SCAFFOLD_LEAK_RE.search(text or ""):
+        return False
+    if _is_malformed_response(text):
+        return False
+
+    if final_fragment:
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        if re.match(r'^[,;:\)\]\}]+', stripped):
+            return False
+        words = re.findall(r"[A-Za-z][A-Za-z']*", stripped)
+        if len(words) < 3:
+            return bool(re.match(
+                r"^(?:yes|no|okay|ok|sure|maybe|nope|yep|thanks|not sure|it depends)\.?$",
+                stripped,
+                re.IGNORECASE
+            ))
+        if stripped[-1] not in ".!?":
+            return False
+    return True
 
 def _clean_llm_output(text):
     """
@@ -1467,6 +1574,14 @@ def speak_stream(sentence_iter):
                 audio_q.put((item, audio_bytes), timeout=5.0)
             except _queue.Full:
                 print("[generate] audio queue full after 5s — Stage C is slow; signaling exit")
+                _push_diagnostic({
+                    "type": "tts_queue_overflow",
+                    "severity": "warn",
+                    "data": {
+                        "queueDepth": audio_q.qsize(),
+                        "stage": "stage_b_to_stage_c",
+                    },
+                })
                 # Without a _DONE sentinel Stage C will block on audio_q.get(timeout=75)
                 # after draining existing items — producing the [stream] audio queue timeout
                 # — TTS stalled hang. Wait up to 15s for Stage C to finish its current
@@ -1574,14 +1689,37 @@ def speak_stream(sentence_iter):
 
     # ── Final guarantee: if nothing was spoken but LLM produced text ────
     # Speak the full collected text via SAPI — ensures response is ALWAYS audible.
+    if _playback_interrupt.is_set() or _abort.is_set():
+        return " ".join(spoken)
+
     if not spoken and collected:
+        # Nothing played via edge-tts -- speak all collected text via SAPI.
         full_text = " ".join(collected)
-        print(f"[stream] edge-tts unavailable — speaking via SAPI: {full_text[:80]}")
+        print(f"[stream] edge-tts unavailable -- speaking via SAPI: {full_text[:80]}")
         _speak_fallback(full_text)
         return full_text
 
+    # Queue-overflow dropout recovery: Stage B drops the current chunk when
+    # audio_q is full after 5s timeout.  The chunk text is in collected[] but
+    # never entered spoken[] because Stage B sent _DONE before processing it.
+    # The existing 'not spoken and collected' guard above only fires when
+    # NOTHING was spoken -- it misses the partial-dropout case where some
+    # chunks played successfully before the overflow.
+    # Here we detect that mismatch and speak the dropped chunks via SAPI
+    # so the complete response is always audible.
+    if spoken and len(spoken) < len(collected) and not _playback_interrupt.is_set() and not _abort.is_set():
+        # Some chunks were dropped by Stage B overflow -- speak the rest via SAPI.
+        spoken_set = set(spoken)
+        dropped = [c for c in collected if c not in spoken_set]
+        if dropped:
+            dropped_text = " ".join(dropped)
+            print(f"[stream] {len(dropped)} chunk(s) dropped by overflow -- SAPI recovery: {dropped_text[:80]}")
+            _speak_fallback(dropped_text)
+            # Extend spoken with recovered chunks so the full response enters history.
+            spoken.extend(dropped)
+
     if not spoken:
-        # Genuinely no LLM output at all — pipeline produced nothing
+        # Genuinely no LLM output at all -- pipeline produced nothing
         print("[stream] LLM produced no speakable text")
         return ""
 
@@ -1615,9 +1753,13 @@ def get_answer_stream(query):
     """
     now          = datetime.now()
     time_context = now.strftime("Today is %A, %B %d %Y. Current time is %I:%M %p.")
-    history      = list(_conversation_history)[-6:]
+    # Consume and reset the correction flag -- applies to this turn only.
+    global _correction_just_occurred
+    _local_correction = _correction_just_occurred
+    _correction_just_occurred = False
 
     started        = False
+    yielded_any_speakable = False
     _seen_sentences: set = set()   # anti-repetition: track sentences within this turn
     _stream_start_ms     = int(time.monotonic() * 1000)
     _first_token_logged  = False
@@ -1628,7 +1770,11 @@ def get_answer_stream(query):
     try:
         with requests.post(
             f"{BACKEND}/api/ai/ask-stream",
-            json={"query": query, "time_context": time_context, "history": history},
+            json={
+                "query": query,
+                "time_context": time_context,
+                "correction_occurred": _local_correction,
+            },
             headers=auth_headers(),
             stream=True,
             timeout=60
@@ -1655,9 +1801,18 @@ def get_answer_stream(query):
                     # Flush any partial sentence still in the buffer
                     if buffer.strip():
                         remainder = _clean_llm_output(buffer.strip())
-                        if remainder:
+                        if remainder and _SCAFFOLD_LEAK_RE.search(remainder):
+                            dbg.stream_event("scaffold-terminated", detail=remainder[:80])
+                            _push_diagnostic({
+                                "type": "scaffold_leak_terminated",
+                                "severity": "warn",
+                                "data": {"sample": remainder[:120]},
+                            })
+                            return
+                        if remainder and _is_speakable_stream_chunk(remainder, final_fragment=True):
                             norm = remainder.lower().strip(" .")
                             if norm not in _seen_sentences:
+                                yielded_any_speakable = True
                                 yield remainder
                     elapsed = int(time.monotonic() * 1000) - _stream_start_ms
                     dbg.stream_event("done", ms=elapsed, token_count=_token_count,
@@ -1705,20 +1860,46 @@ def get_answer_stream(query):
                     sentence = _clean_llm_output(buffer[: best_idx + len(best_sep)].strip())
                     buffer   = buffer[best_idx + len(best_sep):]
                     if sentence:
+                        if _SCAFFOLD_LEAK_RE.search(sentence):
+                            dbg.stream_event("scaffold-terminated", detail=sentence[:80])
+                            _push_diagnostic({
+                                "type": "scaffold_leak_terminated",
+                                "severity": "warn",
+                                "data": {"sample": sentence[:120]},
+                            })
+                            return
+                        if not _is_speakable_stream_chunk(sentence):
+                            dbg.stream_event("malformed-dropped", detail=sentence[:80])
+                            _push_diagnostic({
+                                "type": "malformed_output_dropped",
+                                "severity": "warn",
+                                "data": {"sample": sentence[:120], "reason": "stream_chunk_validation"},
+                            })
+                            return
                         # Anti-repetition: skip sentences already spoken this turn
                         norm = sentence.lower().strip(" .")
                         if norm not in _seen_sentences:
                             _seen_sentences.add(norm)
+                            yielded_any_speakable = True
                             yield sentence
 
             # Stream closed without [DONE] (server closed connection, backend crash,
             # or network reset). Flush whatever is left in the buffer.
             if buffer.strip():
                 remainder = _clean_llm_output(buffer.strip())
-                if remainder:
+                if remainder and _SCAFFOLD_LEAK_RE.search(remainder):
+                    dbg.stream_event("scaffold-terminated", detail=remainder[:80])
+                    _push_diagnostic({
+                        "type": "scaffold_leak_terminated",
+                        "severity": "warn",
+                        "data": {"sample": remainder[:120]},
+                    })
+                    return
+                if remainder and _is_speakable_stream_chunk(remainder, final_fragment=True):
                     started = True
                     norm = remainder.lower().strip(" .")
                     if norm not in _seen_sentences:
+                        yielded_any_speakable = True
                         yield remainder
             elapsed = int(time.monotonic() * 1000) - _stream_start_ms
             dbg.stream_event("closed-no-done", ms=elapsed, token_count=_token_count,
@@ -1737,11 +1918,24 @@ def get_answer_stream(query):
     # returns raw LLM text — no streaming filter ran on it.  Without cleaning,
     # label leakage ("Personal: ...", "General: ...") and bad openers ("Sure thing!")
     # survive to TTS and get stored in conversation history, poisoning future turns.
-    if not started:
+    if not yielded_any_speakable:
         dbg.stream_event("fallback-blocking", detail="streaming produced nothing — falling back to /ask")
+        _push_diagnostic({
+            "type": "llm_no_speakable_text",
+            "severity": "warn",
+            "data": {"query": query[:120]},
+        })
         raw     = send_ask(query)
         cleaned = _clean_llm_output(raw)
-        yield cleaned if cleaned else "I'm having trouble thinking right now."
+        if cleaned and _is_speakable_stream_chunk(cleaned, final_fragment=True):
+            yield cleaned
+        else:
+            _push_diagnostic({
+                "type": "malformed_output_dropped",
+                "severity": "warn",
+                "data": {"sample": cleaned[:120] if cleaned else "", "reason": "fallback_validation"},
+            })
+            yield "I'm having trouble thinking right now."
 
 
 # ─────────────────────────────────────────────
@@ -1756,6 +1950,51 @@ _EMOTIONAL_RE = re.compile(
     r'not okay|feel(?:ing)?\s+(?:bad|terrible|awful|low|down|lost))\b',
     re.IGNORECASE
 )
+
+# Correction / topic-reset detection.
+# Matched BEFORE the LLM path so the most recent stale history pair can be
+# trimmed before the next prompt is assembled.  Prevents a wrong answer from
+# surviving in the 6-entry context window and continuing to anchor future turns.
+# Trim depth: exactly 1 Q+A pair (2 deque entries) -- enough to break stale
+# topic momentum without destroying legitimate earlier context.
+_CORRECTION_RE = re.compile(
+    r'\b('
+    r"you'?re\s+wrong"
+    r"|that'?s\s+(?:wrong|incorrect|not\s+right|not\s+what\s+i\s+(?:asked|said|wanted|meant))"
+    r'|that\s+was\s+wrong'
+    r'|you\s+got\s+(?:that\s+)?wrong'
+    r'|(?:change|switch)\s+(?:the\s+)?topic'
+    r'|stop\s+talking\s+about\s+(?:this|that)'
+    r"|let'?s?\s+(?:talk|discuss|chat)\s+about\s+something\s+else"
+    r'|forget\s+(?:that|what\s+(?:i|you)\s+said)'
+    r'|never\s+mind\s+(?:that|what\s+i\s+said)'
+    r'|not\s+what\s+i\s+(?:asked|said|meant)'
+    r'|move\s+on\s+from\s+(?:this|that)'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# Separators between the correction clause and a follow-up query.
+# "that's wrong, tell me about X" -- after stripping, only "tell me about X" remains.
+_CORRECTION_LINK_RE = re.compile(
+    r'\s*[,;]\s*(?:and\s+|but\s+)?|\s+and\s+|\s+but\s+',
+    re.IGNORECASE,
+)
+
+
+def _extract_correction_remainder(text: str) -> str:
+    """
+    Strip the correction clause from `text` and return the remainder.
+    If the whole utterance is the correction, returns empty string.
+    Example: 'that is wrong, what is inflation?' -> 'what is inflation?'
+    """
+    m = _CORRECTION_RE.search(text)
+    if not m:
+        return text
+    after = text[m.end():].strip()
+    after = _CORRECTION_LINK_RE.sub('', after, count=1).strip()
+    return after
+
 
 def _assess_query(text):
     """
@@ -1797,11 +2036,14 @@ def _assess_query(text):
 # were missing, causing "I want to play lofi on Spotify" to never strip to
 # "play ..." and therefore miss the open_app / media routing path entirely.
 _COMMAND_FILLERS = (
+    # Longest/most-specific first so greedy prefix stripping is unambiguous
     "i need you to ", "i want you to ", "i would like you to ",
     "i'd like you to ", "i want to ", "i would like to ",
-    "i'd like to ", "let me ", "go ahead and ", "would you please ",
+    "i'd like to ", "i need to ", "would you mind ", "will you please ",
+    "let me ", "go ahead and ", "would you please ",
     "can you please ", "could you please ", "would you ", "could you ",
-    "can you ", "please ", "hey aura ", "aura ", "hey ",
+    "will you ", "can you ", "please ", "just ",
+    "hey aura ", "aura ", "hey ",
     "ok ", "okay ",
 )
 
@@ -1990,6 +2232,30 @@ def _normalize_transcript(text_lower: str) -> str:
         result = stripped
     # Also strip any orphaned leading punctuation left behind
     result = result.lstrip(",. !?")
+
+    # Gerund normalization: convert action-verb gerunds to base form so that
+    # _is_at_command_start() can match them against _OPEN_VERBS / _TIMER_COMMAND_PHRASES.
+    # Only fires when the gerund is the FIRST word after filler stripping — i.e. when
+    # "would you mind opening spotify" strips "would you mind " and leaves "opening spotify".
+    # Restricted to known action verbs to avoid mangling conversational sentences
+    # like "I've been playing guitar" or "She was opening the door".
+    _GERUND_MAP = (
+        ("opening ",   "open "),
+        ("playing ",   "play "),
+        ("launching ", "launch "),
+        ("starting ",  "start "),
+        ("setting ",   "set "),
+        ("watching ",  "watch "),
+        ("searching ", "search "),
+        ("browsing ",  "browse "),
+        ("buying ",    "buy "),
+        ("ordering ",  "order "),
+    )
+    for gerund, base in _GERUND_MAP:
+        if result.startswith(gerund):
+            result = base + result[len(gerund):]
+            break
+
     return result.strip() if result.strip() else text_lower
 
 
@@ -3007,13 +3273,11 @@ def send_ask(query):
         # Slice to [-6:] (3 Q+A pairs) — same window as get_answer_stream().
         # JS buildPrompt() also slices to -6, so sending more entries is wasteful.
         # This aligns both LLM paths to the same authoritative 3-pair window.
-        history = list(_conversation_history)[-6:]
         resp    = requests.post(
             f"{BACKEND}/api/ai/ask",
             json={
                 "query":        query,
                 "time_context": now.strftime("Today is %A, %B %d %Y. Current time is %I:%M %p."),
-                "history":      history,
             },
             headers=auth_headers(),
             timeout=30
@@ -3134,6 +3398,7 @@ def _load_history_on_startup() -> None:
       - Malformed response   → logged, empty history
       - Invalid turn entries → silently skipped (role/content validation)
     """
+    global _history_loaded_for_token
     try:
         resp = requests.get(
             f"{BACKEND}/api/conversation/history",
@@ -3146,6 +3411,7 @@ def _load_history_on_startup() -> None:
 
         turns = resp.json().get("turns", [])
         loaded = 0
+        _conversation_history.clear()
         for turn in turns:
             role    = turn.get("role", "")
             content = turn.get("content", "")
@@ -3158,7 +3424,11 @@ def _load_history_on_startup() -> None:
                 # User turns are not sanitized — they're raw STT and should be preserved.
                 if role == "assistant":
                     cleaned = _clean_llm_output(content)
-                    content = cleaned if cleaned else content  # never blank an entry
+                    if not cleaned or _is_malformed_response(cleaned) or _SCAFFOLD_LEAK_RE.search(cleaned):
+                        if _conversation_history and _conversation_history[-1].get("role") == "user":
+                            _conversation_history.pop()
+                        continue
+                    content = cleaned
                 _conversation_history.append({"role": role, "content": content})
                 loaded += 1
 
@@ -3171,6 +3441,15 @@ def _load_history_on_startup() -> None:
         print("[History] Backend unreachable — starting with empty history")
     except Exception as e:
         print(f"[History] Load error: {e} — starting with empty history")
+
+
+def _load_history_if_needed(force: bool = False) -> None:
+    global _history_loaded_for_token
+    if not _token:
+        return
+    if force or _history_loaded_for_token != _token:
+        _load_history_on_startup()
+        _history_loaded_for_token = _token
 
 
 def _persist_turn_async(user_content: str, assistant_content: str) -> None:
@@ -3193,17 +3472,32 @@ def _persist_turn_async(user_content: str, assistant_content: str) -> None:
     """
     def _write():
         try:
-            resp = requests.post(
-                f"{BACKEND}/api/conversation/history",
-                json={"turns": [
-                    {"role": "user",      "content": user_content},
-                    {"role": "assistant", "content": assistant_content},
-                ]},
-                headers=auth_headers(),
-                timeout=5
-            )
-            if resp.status_code not in (200, 201):
-                print(f"[History] Persist failed: HTTP {resp.status_code}")
+            with _history_persist_lock:
+                # Sanitize assistant content before persisting.  speak_stream() assembles
+                # the response from per-sentence-cleaned chunks, but any prose contamination
+                # that survived _clean_llm_output at the sentence level is caught here as a
+                # final pass before it enters MongoDB.  _load_history_on_startup() also runs
+                # _clean_llm_output on load, but cleaning at write-time ensures MongoDB is
+                # the ground truth rather than relying on the read-time pass alone.
+                clean_assistant = _clean_llm_output(assistant_content)
+                if (
+                    not clean_assistant
+                    or _is_malformed_response(clean_assistant)
+                    or _SCAFFOLD_LEAK_RE.search(clean_assistant)
+                ):
+                    print("[History] Skipping malformed assistant turn persist")
+                    return
+                resp = requests.post(
+                    f"{BACKEND}/api/conversation/history",
+                    json={"turns": [
+                        {"role": "user",      "content": user_content},
+                        {"role": "assistant", "content": clean_assistant},
+                    ]},
+                    headers=auth_headers(),
+                    timeout=5
+                )
+                if resp.status_code not in (200, 201):
+                    print(f"[History] Persist failed: HTTP {resp.status_code}")
         except requests.exceptions.ConnectionError:
             pass   # backend not running — in-memory state is fine
         except Exception as e:
@@ -3322,7 +3616,6 @@ if __name__ == "__main__":
     # If the backend is unavailable, voice.py proceeds with an empty history.
     # This call is synchronous at startup — it happens before any voice activity,
     # so the 5s timeout does not impact first-audio latency.
-    _load_history_on_startup()
 
     poll_thread = threading.Thread(target=reminder_poll_loop, daemon=True)
     poll_thread.start()
@@ -3530,7 +3823,6 @@ if __name__ == "__main__":
             _push_event({"type": "voice", "state": "speaking", "text": answer})
             speak(answer)
             _push_event({"type": "voice", "state": "idle"})
-            _persist_turn_async(text, answer)   # MongoDB record only — not in LLM context
 
         elif intent.startswith("open_app:"):
             parts    = intent.split(":")
@@ -3561,7 +3853,6 @@ if __name__ == "__main__":
             _push_event({"type": "voice", "state": "speaking", "text": answer})
             speak(answer)
             _push_event({"type": "voice", "state": "idle"})
-            _persist_turn_async(text, answer)   # MongoDB record only — not in LLM context
 
         elif intent in ("set_reminder", "store_memory"):
             # Pass pre-computed intent to avoid running detect_intent() a second time
@@ -3569,21 +3860,66 @@ if __name__ == "__main__":
             _push_event({"type": "voice", "state": "speaking", "text": answer})
             speak(answer)
             _push_event({"type": "voice", "state": "idle"})
-            _persist_turn_async(text, answer)   # MongoDB record only — not in LLM context
 
         # ── LLM path — with decision engine pre-filter ───────────────
         else:
-            mode = _assess_query(text)
+            # ---- Correction / topic-reset handling ----
+            # Runs before _assess_query so the stale history pair is already gone
+            # when the LLM path assembles the next prompt.
+            #
+            # When a correction is detected:
+            #   1. Pop the most recent Q+A pair (2 entries) from _conversation_history.
+            #      This removes the stale topic anchor before the next prompt is built.
+            #   2. If the utterance contains a follow-up query after the correction
+            #      clause ("that's wrong, tell me about inflation"), route the remainder
+            #      as the real query -- so AURA trims history AND answers in one turn.
+            #   3. If the utterance is ONLY a correction, acknowledge and loop back
+            #      without invoking the LLM or storing anything.
+            #   The correction utterance itself is NEVER stored in history.
+            _was_correction = bool(_CORRECTION_RE.search(normalized_text))
+            if _was_correction:
+                # Trim the most recent pair from history if present
+                if len(_conversation_history) >= 2:
+                    _conversation_history.pop()   # assistant turn
+                    _conversation_history.pop()   # user turn
+                    print("[correction] Trimmed 1 stale Q+A pair from history")
+                # Check for a follow-up query in the same utterance
+                _correction_remainder = _extract_correction_remainder(normalized_text)
+                if _correction_remainder and len(_correction_remainder.split()) >= 3:
+                    # Route the follow-up as the real query for this turn
+                    normalized_text = _correction_remainder
+                    text = _correction_remainder  # history stores the follow-up, not the correction
+                    _correction_just_occurred = True  # consumed by get_answer_stream this turn
+                    print("[correction] Routing remainder: %r" % _correction_remainder[:60])
+                else:
+                    # Pure correction with no follow-up: acknowledge, skip LLM, skip history
+                    _ack = "Got it, I'll move on."
+                    _push_event({"type": "voice", "state": "speaking", "text": _ack})
+                    speak(_ack)
+                    _push_event({"type": "voice", "state": "idle"})
+                    continue  # no history append, no persist
+
+            # Run _assess_query on normalized_text (hesitation fillers stripped)
+            # rather than raw `text`. Without this, Whisper-added fillers inflate
+            # word count: "um smartwatch" = 2 words -> 'ask' instead of 'clarify'.
+            # Using normalized_text means the word-count gate sees the same input
+            # as detect_intent, keeping routing and assess_query in sync.
+            mode = _assess_query(normalized_text)
 
             if mode == 'clarify':
-                # Too short / ambiguous — ask for more detail without touching LLM
+                # Too short / ambiguous — ask for more detail without touching LLM.
+                # IMPORTANT: clarify turns are NEVER stored in _conversation_history
+                # or persisted to MongoDB.  They are noise-gate artifacts — the STT
+                # captured something too short to be a real query (garbled audio,
+                # background noise, a single word).  Storing them creates topic
+                # anchors: a future LLM call would see e.g. "User: smartwatch /
+                # Assistant: I didn't catch that" and treat "smartwatch" as prior
+                # conversational context, causing cross-topic bleed.
                 answer = "I didn't quite catch that... could you be a bit more specific?"
                 _push_event({"type": "voice", "state": "speaking", "text": answer})
                 speak(answer)
                 _push_event({"type": "voice", "state": "idle"})
-                _conversation_history.append({"role": "user",      "content": text})
-                _conversation_history.append({"role": "assistant", "content": answer})
-                _persist_turn_async(text, answer)
+                # Intentionally no _conversation_history.append() and no _persist_turn_async().
 
             else:
                 if mode == 'empathize':
@@ -3624,12 +3960,16 @@ if __name__ == "__main__":
                     dbg.loop_state("IDLE", "speaking phase complete")
                     _push_event({"type": "voice", "state": "idle"})
 
-                # Handle interrupt: skip Enter next turn
-                if _playback_interrupt.is_set():
+                # Handle interrupt: skip Enter next turn.
+                # Record interrupt state BEFORE _stop_all_playback() clears the flag.
+                # This snapshot is used below to prevent partial/interrupted responses
+                # from entering _conversation_history or MongoDB.
+                _interrupted_this_turn = _playback_interrupt.is_set()
+                if _interrupted_this_turn:
                     _stop_all_playback()
                     _was_interrupted = True
 
-                if response and response.strip() != _last_response.strip():
+                if response and not _interrupted_this_turn and response.strip() != _last_response.strip():
                     _last_response = response
                     # Push completed response to UI chat — text delivery for transcript display.
                     # NOTE: uses state:"speaking" so the UI receives the text; an idle event
@@ -3641,14 +3981,17 @@ if __name__ == "__main__":
                     # history.  It was already spoken (can't un-play audio), but we
                     # prevent it from poisoning subsequent LLM prompts as a behavioral
                     # example.  Log for visibility.
-                    if _is_malformed_response(response):
+                    if _is_malformed_response(response) or _SCAFFOLD_LEAK_RE.search(response) or not _is_valid_response(response):
                         print(f"[guard] Malformed response discarded from history: "
                               f"{response[:80]!r}")
                         dbg.malformed(response, "action-confirmation or structural garbage matched _MALFORMED_RESPONSE_RE")
+                        _push_diagnostic({
+                            "type": "malformed_output_dropped",
+                            "severity": "warn",
+                            "data": {"sample": response[:120], "reason": "history_guard"},
+                        })
                     else:
-                        _conversation_history.append({"role": "user",      "content": text})
-                        _conversation_history.append({"role": "assistant", "content": response})
-                    # Persist after dedup guard — only persist what was actually appended.
-                    # Partial responses (from interrupted speak_stream) are persisted as-is:
-                    # AURA spoke them, the user heard them, they are part of the conversation.
-                    _persist_turn_async(text, response)
+                        pass
+                        # Persist only what was actually appended to _conversation_history.
+                        # Malformed responses are excluded from both the in-memory deque and
+                        # MongoDB — preventing cross-session contamination on restart.

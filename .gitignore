@@ -73,6 +73,8 @@ MANIFEST
 # These patterns catch any accidental local model storage
 whisper_models/
 models/
+!backend/models/
+!backend/models/*.js
 *.bin
 *.pt
 *.onnx

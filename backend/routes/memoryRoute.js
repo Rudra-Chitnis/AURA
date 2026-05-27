@@ -3,6 +3,7 @@ const router = express.Router();
 
 const protect = require("../middleware/authMiddleware");
 const { storeMemory, getMemories, searchMemory } = require("../services/memoryService");
+const { getConsolidationSummary } = require("../services/memoryConsolidationService");
 
 
 // STORE A MEMORY
@@ -31,6 +32,17 @@ router.get("/list", protect, async (req, res, next) => {
   try {
     const memories = await getMemories(req.user._id);
     res.json({ memories });
+  } catch (err) {
+    next(err);
+  }
+});
+
+
+// LIST CONSOLIDATED SEMANTIC PATTERNS
+router.get("/patterns", protect, async (req, res, next) => {
+  try {
+    const patterns = await getConsolidationSummary(req.user._id);
+    res.json({ patterns });
   } catch (err) {
     next(err);
   }

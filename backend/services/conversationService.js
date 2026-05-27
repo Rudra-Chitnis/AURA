@@ -59,5 +59,18 @@ const loadHistory = async (userId, limit = 20) => {
     .map(t => ({ role: t.role, content: t.content }));
 };
 
+const removeLastPair = async (userId) => {
+  const doc = await ConversationHistory.findOne({ user: userId });
+  if (!doc || !Array.isArray(doc.turns) || doc.turns.length === 0) return 0;
 
-module.exports = { saveHistory, loadHistory };
+  let removed = 0;
+  while (doc.turns.length && removed < 2) {
+    doc.turns.pop();
+    removed++;
+  }
+  doc.updatedAt = new Date();
+  await doc.save();
+  return removed;
+};
+
+module.exports = { saveHistory, loadHistory, removeLastPair };

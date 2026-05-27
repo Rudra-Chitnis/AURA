@@ -1,14 +1,16 @@
 const { pipeline } = require("@xenova/transformers");
 
 let extractor;
+let extractorPromise;
 
 // Load model only once (VERY IMPORTANT)
 const loadModel = async () => {
   if (!extractor) {
-    extractor = await pipeline(
+    extractorPromise ||= pipeline(
       "feature-extraction",
       "Xenova/all-MiniLM-L6-v2"
     );
+    extractor = await extractorPromise;
   }
   return extractor;
 };
