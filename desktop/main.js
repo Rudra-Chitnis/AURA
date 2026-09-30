@@ -8,8 +8,7 @@ const fs    = require("fs");
 const http  = require("http");
 const { spawn, execFile } = require("child_process");
 
-const { TimerManager }    = require("./timerManager");
-const { ReminderManager } = require("./reminderManager");
+const { AuraRuntime } = require("./core/auraRuntime");
 
 // ─── single instance lock ─────────────────────────────────────────────────────
 // Prevents double-click from launching a second Electron instance.
@@ -50,10 +49,8 @@ app.isQuitting   = false;
 let _backendRestartCount = 0;
 let _voiceRestartCount   = 0;
 
-// ─── persistent time managers ─────────────────────────────────────────────────
-// Initialised inside app.whenReady() after app.getPath() becomes available.
-const timerManager    = new TimerManager();
-const reminderManager = new ReminderManager();
+// The headless runtime is composed after Electron exposes its user data path.
+let auraRuntime = null;
 
 // ─── startup phase tracking ───────────────────────────────────────────────────
 // Phases (in order): launching → starting-backend → checking-ollama →
@@ -661,8 +658,8 @@ function startVoice() {
       if (timerMatch) {
         const secs  = parseInt(timerMatch[1], 10);
         const label = timerMatch[2].trim();
-        timerManager.setTimer(label, secs);
-        safeSend("timer-tick", timerManager.listTimers());
+        auraRuntime?.timers.setTimer(label, secs);
+        if (auraRuntime) safeSend("timer-tick", auraRuntime.timers.listTimers());
         console.log(`[AURA] Timer registered via voice: "${label}" ${secs}s`);
       }
 
@@ -672,8 +669,7 @@ function startVoice() {
       if (reminderMatch) {
         const text   = reminderMatch[1].trim();
         const fireAt = reminderMatch[2].trim();
-        reminderManager.setReminder(text, fireAt);
-        safeSend("reminder-updated", reminderManager.listReminders());
+        auraRuntime?.reminders.setReminder(text, fireAt);
         console.log(`[AURA] Reminder registered via voice: "${text}" at ${fireAt}`);
       }
 
@@ -952,27 +948,27 @@ function _speakViaVoice(text) {
 
 // ── timer IPC handlers ────────────────────────────────────────────────────────
 ipcMain.handle("set-timer", (_, { label, seconds }) => {
-  const timer = timerManager.setTimer(label, seconds);
-  safeSend("timer-tick", timerManager.listTimers());
+  const timer = auraRuntime.timers.setTimer(label, seconds);
+  safeSend("timer-tick", auraRuntime.timers.listTimers());
   return timer;
 });
 ipcMain.handle("cancel-timer", (_, id) => {
-  timerManager.cancelTimer(id);
-  safeSend("timer-tick", timerManager.listTimers());
+  auraRuntime.timers.cancelTimer(id);
+  safeSend("timer-tick", auraRuntime.timers.listTimers());
   return true;
 });
-ipcMain.handle("list-timers", () => timerManager.listTimers());
+ipcMain.handle("list-timers", () => auraRuntime?.timers.listTimers() || []);
 
 // ── reminder IPC handlers ─────────────────────────────────────────────────────
 ipcMain.handle("set-reminder",    (_, { text, fireAt }) => {
-  const r = reminderManager.setReminder(text, fireAt);
+  const r = auraRuntime.reminders.setReminder(text, fireAt);
   return r;
 });
 ipcMain.handle("cancel-reminder", (_, id) => {
-  reminderManager.cancelReminder(id);
+  auraRuntime.reminders.cancelReminder(id);
   return true;
 });
-ipcMain.handle("list-reminders",  () => reminderManager.listReminders());
+ipcMain.handle("list-reminders",  () => auraRuntime?.reminders.listReminders() || []);
 
 // ── wake voice from sleep ─────────────────────────────────────────────────────
 ipcMain.handle("voice-wake", () => {
@@ -993,28 +989,28 @@ app.whenReady().then(() => {
   nativeTheme.themeSource = "dark";
   emitPhase("launching");
 
-  // ── Init persistent timer and reminder managers ────────────────────────────
-  timerManager.init(
-    // onTick: broadcast live countdown to UI every second
-    (timers) => safeSend("timer-tick", timers),
-    // onFired: notify UI + speak via voice.py if active
-    (timer, text) => {
-      safeSend("timer-fired", { id: timer.id, label: timer.label, text });
-      safeSend("timer-tick",  timerManager.listTimers());
-      _speakViaVoice(text);
-    }
-  );
-
-  reminderManager.init(
-    // onFired
-    (reminder, text) => {
-      safeSend("reminder-fired",   { id: reminder.id, text: reminder.text, body: text });
-      safeSend("reminder-updated", reminderManager.listReminders());
-      _speakViaVoice(text);
-    },
-    // onUpdated: sync list to UI
-    (reminders) => safeSend("reminder-updated", reminders)
-  );
+  // The runtime owns scheduling and persistence; this shell adapter preserves
+  // the existing IPC, OS notification, and voice delivery behavior.
+  auraRuntime = new AuraRuntime({ dataDirectory: app.getPath("userData") });
+  auraRuntime.on("runtime:state", state => safeSend("runtime-state", state));
+  auraRuntime.on("timer:tick", timers => safeSend("timer-tick", timers));
+  auraRuntime.on("timer:fired", ({ timer, body }) => {
+    try {
+      if (Notification.isSupported()) new Notification({ title: "AURA Timer", body, silent: false }).show();
+    } catch (e) { console.warn("[TimerManager] Notification failed:", e.message); }
+    safeSend("timer-fired", { id: timer.id, label: timer.label, text: body });
+    safeSend("timer-tick", auraRuntime.timers.listTimers());
+    _speakViaVoice(body);
+  });
+  auraRuntime.on("reminder:updated", reminders => safeSend("reminder-updated", reminders));
+  auraRuntime.on("reminder:fired", ({ reminder, body }) => {
+    try {
+      if (Notification.isSupported()) new Notification({ title: "AURA Reminder", body, silent: false }).show();
+    } catch (e) { console.warn("[ReminderManager] Notification failed:", e.message); }
+    safeSend("reminder-fired", { id: reminder.id, text: reminder.text, body });
+    _speakViaVoice(body);
+  });
+  auraRuntime.start();
 
   startBackend();
   createWindow();
@@ -1030,8 +1026,7 @@ app.on("before-quit", () => {
   globalShortcut.unregisterAll();
 
   // Clean up manager intervals/handles before exit
-  timerManager.destroy();
-  reminderManager.destroy();
+  auraRuntime?.stop();
 
   // Send graceful quit signal to voice.py first (allows TTS drain + audio close).
   if (voiceProc && voiceProc.stdin && !voiceProc.stdin.destroyed) {
