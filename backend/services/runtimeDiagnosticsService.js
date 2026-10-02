@@ -2,16 +2,12 @@ const axios = require("axios");
 const mongoose = require("mongoose");
 const DiagnosticEvent = require("../models/diagnosticEventModel");
 const wsHub = require("../wsHub");
+const { DiagnosticRuntime } = require("../core/diagnosticRuntime");
 
-const MAX_RECENT_PER_SCOPE = 120;
 const DEFAULT_LIMIT = 80;
 const PERSIST_LIMIT = 500;
 const OLLAMA_URL = process.env.OLLAMA_URL || process.env.OLLAMA_HOST || "http://localhost:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_DIAGNOSTIC_MODEL || process.env.OLLAMA_MODEL || "mistral";
-
-const _recent = new Map();
-
-const scopeKey = (userId) => userId ? String(userId) : "__global__";
 
 const sanitizeData = (data = {}) => {
   const out = {};
@@ -66,18 +62,6 @@ const infer = (event) => {
   }
 };
 
-const pushRecent = (event) => {
-  const key = scopeKey(event.user);
-  const list = _recent.get(key) || [];
-  list.unshift(event);
-  _recent.set(key, list.slice(0, MAX_RECENT_PER_SCOPE));
-  if (key !== "__global__") {
-    const global = _recent.get("__global__") || [];
-    global.unshift(event);
-    _recent.set("__global__", global.slice(0, MAX_RECENT_PER_SCOPE));
-  }
-};
-
 const persistEvent = async (event) => {
   try {
     if (mongoose.connection.readyState !== 1) return;
@@ -105,9 +89,9 @@ const persistEvent = async (event) => {
   }
 };
 
-const record = (raw = {}) => {
+const createEvent = (raw = {}) => {
   const inferred = infer(raw);
-  const event = {
+  return {
     user: raw.user || raw.userId || null,
     source: raw.source || "backend",
     type: raw.type || "runtime_event",
@@ -117,36 +101,25 @@ const record = (raw = {}) => {
     data: sanitizeData(raw.data || {}),
     createdAt: new Date().toISOString(),
   };
-
-  pushRecent(event);
-  persistEvent(event);
-
-  try {
-    wsHub.broadcast({ ...event, diagnosticType: event.type, type: "diagnostic" });
-  } catch (_) {
-    // Diagnostics must never affect runtime behavior.
-  }
-
-  return event;
 };
 
-const recent = async (userId, limit = DEFAULT_LIMIT) => {
-  const userEvents = _recent.get(scopeKey(userId)) || [];
-  const globalEvents = userId ? (_recent.get("__global__") || []).filter(e => !e.user) : (_recent.get("__global__") || []);
-  const inMemory = [...userEvents, ...globalEvents]
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  if (inMemory.length >= Math.min(limit, 20)) return inMemory.slice(0, limit);
-
-  try {
-    const query = userId ? { $or: [{ user: userId }, { user: null }] } : {};
-    return await DiagnosticEvent.find(query)
-      .sort({ createdAt: -1 })
-      .limit(limit)
-      .lean();
-  } catch (_) {
-    return inMemory.slice(0, limit);
-  }
+const loadPersistedEvents = (userId, limit) => {
+  const query = userId ? { $or: [{ user: userId }, { user: null }] } : {};
+  return DiagnosticEvent.find(query)
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .lean();
 };
+
+const diagnosticRuntime = new DiagnosticRuntime({
+  createEvent,
+  persistEvent,
+  loadPersistedEvents,
+  broadcastEvent: event => wsHub.broadcast({ ...event, diagnosticType: event.type, type: "diagnostic" }),
+});
+
+const record = raw => diagnosticRuntime.record(raw);
+const recent = (userId, limit = DEFAULT_LIMIT) => diagnosticRuntime.recent(userId, limit);
 
 const summarize = async (userId, limit = DEFAULT_LIMIT) => {
   const events = await recent(userId, limit);
