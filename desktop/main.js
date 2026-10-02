@@ -5,11 +5,11 @@ const {
 const path  = require("path");
 const os    = require("os");
 const fs    = require("fs");
-const http  = require("http");
 const { spawn, execFile,spawnSync } = require("child_process");
 
 const { AuraRuntime } = require("./core/auraRuntime");
 const { waitForBackend } = require("./core/backendReadiness");
+const { createOllamaReadiness } = require("./core/ollamaReadiness");
 
 // ─── single instance lock ─────────────────────────────────────────────────────
 // Prevents double-click from launching a second Electron instance.
@@ -274,48 +274,12 @@ function createWindow() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const OLLAMA_PRIMARY_MODEL = process.env.OLLAMA_MODEL      || "mistral";
-
-// Tier 1 — server ping only
-function checkOllamaServer(timeout = 5000) {
-  return new Promise((resolve) => {
-    const req = http.get(`http://localhost:${OLLAMA_PORT}/`, (res) => {
-      resolve(true);
-      res.resume();
-    });
-    req.on("error", () => resolve(false));
-    req.setTimeout(timeout, () => { req.destroy(); resolve(false); });
-  });
-}
-
-// Backward-compat alias — still called by backend-wait loop below
-const checkOllamaHealth = checkOllamaServer;
-
-// Tier 2 — model availability check via /api/tags
-// Returns array of available model name strings, or null on any failure.
-function checkOllamaModels(timeout = 5000) {
-  return new Promise((resolve) => {
-    const req = http.get(`http://localhost:${OLLAMA_PORT}/api/tags`, (res) => {
-      let body = "";
-      res.on("data", d => { body += d; });
-      res.on("end", () => {
-        try {
-          const parsed = JSON.parse(body);
-          const names  = (parsed.models || []).map(m => m.name || "");
-          resolve(names);
-        } catch { resolve(null); }
-      });
-    });
-    req.on("error", () => resolve(null));
-    req.setTimeout(timeout, () => { req.destroy(); resolve(null); });
-  });
-}
-
-// Check whether the primary model name appears in the models list.
-// Matches prefix — "mistral" matches "mistral:latest", "mistral:7b", etc.
-function _modelAvailable(modelList) {
-  if (!modelList) return false;
-  return modelList.some(n => n.toLowerCase().startsWith(OLLAMA_PRIMARY_MODEL.toLowerCase()));
-}
+const ollamaReadiness = createOllamaReadiness({
+  port: OLLAMA_PORT,
+  primaryModel: OLLAMA_PRIMARY_MODEL,
+  onStatus: status => safeSend("ollama-status", status),
+  onLog: (level, message) => console[level](message),
+});
 
 // ─── Ollama startup ───────────────────────────────────────────────────────────
 // Ensures Ollama server is running and the primary model is available.
@@ -324,12 +288,12 @@ async function ensureOllama() {
   emitPhase("checking-ollama");
 
   // ── Fast path: server already running ───────────────────────────────────────
-  const alreadyUp = await checkOllamaServer(4000);
+  const alreadyUp = await ollamaReadiness.checkServer(4000);
   if (alreadyUp) {
     console.log("[AURA] Ollama server already running on :11434");
     // Check model availability while we're here
-    const models = await checkOllamaModels(3000);
-    if (_modelAvailable(models)) {
+    const models = await ollamaReadiness.checkModels(3000);
+    if (ollamaReadiness.modelAvailable(models)) {
       console.log(`[AURA] Model '${OLLAMA_PRIMARY_MODEL}' confirmed available.`);
       safeSend("ollama-status", "running");
     } else {
@@ -338,7 +302,7 @@ async function ensureOllama() {
       console.log(`[AURA] Ollama up — model '${OLLAMA_PRIMARY_MODEL}' not in /api/tags yet (may still be loading).`);
       safeSend("ollama-status", "loading-model");
       // Poll in background until model appears or 3-minute timeout
-      _pollUntilModelReady(0, 36);   // 36 × 5s = 3 min
+      ollamaReadiness.pollUntilModelReady(0, 36);   // 36 × 5s = 3 min
     }
     return;
   }
@@ -363,24 +327,20 @@ async function ensureOllama() {
   }
 
   // ── Wait up to 45s for server to bind ───────────────────────────────────────
-  const deadline = Date.now() + 45000;
-  while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 1500));
-    const up = await checkOllamaServer(1500);
-    if (up) {
-      console.log("[AURA] Ollama server started.");
-      // Now check model availability
-      const models = await checkOllamaModels(3000);
-      if (_modelAvailable(models)) {
-        console.log(`[AURA] Model '${OLLAMA_PRIMARY_MODEL}' confirmed available.`);
-        safeSend("ollama-status", "running");
-      } else {
-        console.log(`[AURA] Ollama up — model '${OLLAMA_PRIMARY_MODEL}' not loaded yet. Polling...`);
-        safeSend("ollama-status", "loading-model");
-        _pollUntilModelReady(0, 36);
-      }
-      return;
+  const serverReady = await ollamaReadiness.waitForServer(45000, 1500, 1500);
+  if (serverReady) {
+    console.log("[AURA] Ollama server started.");
+    // Now check model availability
+    const models = await ollamaReadiness.checkModels(3000);
+    if (ollamaReadiness.modelAvailable(models)) {
+      console.log(`[AURA] Model '${OLLAMA_PRIMARY_MODEL}' confirmed available.`);
+      safeSend("ollama-status", "running");
+    } else {
+      console.log(`[AURA] Ollama up — model '${OLLAMA_PRIMARY_MODEL}' not loaded yet. Polling...`);
+      safeSend("ollama-status", "loading-model");
+      ollamaReadiness.pollUntilModelReady(0, 36);
     }
+    return;
   }
 
   // ── 45s expired — still polling in background ────────────────────────────────
@@ -389,53 +349,7 @@ async function ensureOllama() {
   // so the user will eventually get a response.  Do NOT mark "unavailable" here.
   console.log("[AURA] Ollama still loading after 45s — polling in background.");
   safeSend("ollama-status", "starting");
-  _pollUntilServerReady(0, 72);   // 72 × 5s = 6 min total from spawn
-}
-
-// Background poll: wait for server to respond, then check model.
-// maxAttempts × 5s = total wait time.
-function _pollUntilServerReady(attempts, maxAttempts) {
-  if (attempts >= maxAttempts) {
-    console.warn("[AURA] Ollama not responding after 6 minutes — marking unavailable.");
-    safeSend("ollama-status", "unavailable");
-    return;
-  }
-  setTimeout(async () => {
-    const up = await checkOllamaServer(3000);
-    if (up) {
-      console.log(`[AURA] Ollama became available after ~${45 + attempts * 5}s.`);
-      const models = await checkOllamaModels(3000);
-      if (_modelAvailable(models)) {
-        safeSend("ollama-status", "running");
-      } else {
-        safeSend("ollama-status", "loading-model");
-        _pollUntilModelReady(0, 36);
-      }
-    } else {
-      _pollUntilServerReady(attempts + 1, maxAttempts);
-    }
-  }, 5000);
-}
-
-// Background poll: wait for model to appear in /api/tags after server is up.
-function _pollUntilModelReady(attempts, maxAttempts) {
-  if (attempts >= maxAttempts) {
-    // Model never appeared — likely not downloaded. Server is still up so inference
-    // may work if user pulls the model manually. Keep "loading-model" rather than
-    // "unavailable" to avoid false permanent failure state.
-    console.warn(`[AURA] Model '${OLLAMA_PRIMARY_MODEL}' not found after polling. May need: ollama pull ${OLLAMA_PRIMARY_MODEL}`);
-    safeSend("ollama-status", "unavailable");
-    return;
-  }
-  setTimeout(async () => {
-    const models = await checkOllamaModels(3000);
-    if (_modelAvailable(models)) {
-      console.log(`[AURA] Model '${OLLAMA_PRIMARY_MODEL}' now available.`);
-      safeSend("ollama-status", "running");
-    } else {
-      _pollUntilModelReady(attempts + 1, maxAttempts);
-    }
-  }, 5000);
+  ollamaReadiness.pollUntilServerReady(0, 72);   // 72 × 5s = 6 min total from spawn
 }
 
 // ─── find Python executable ───────────────────────────────────────────────────
