@@ -29,6 +29,7 @@ release/
 desktop/dist/
 desktop/release/
 desktop/build/
+desktop/certs/
 benchmark/reports/
 
 # ── Python ────────────────────────────────────────────────────────────────────

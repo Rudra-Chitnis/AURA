@@ -441,19 +441,66 @@ The backend initializes the existing MongoDB services, HTTP API, WebSocket hub,
 and timer/reminder runtime. Stop it with `Ctrl+C`; it handles SIGINT/SIGTERM and
 closes the HTTP/WebSocket servers and persistence connection. To start the
 desktop adapter, run `cd desktop` then `npm start` (it starts its managed backend
-and voice worker as before). To run voice independently from the repository
-root, use PowerShell:
+and voice worker as before).
+
+#### Browser development with microphone voice
+
+Browser voice uses the existing Python voice worker and faster-whisper pipeline.
+The browser records a short microphone clip after you press **Start speaking**;
+the worker transcribes it, routes it through the existing AURA/Core flow, and
+uses the existing TTS output. Electron continues to use its original direct
+`sounddevice` microphone path.
+
+Start the backend in one terminal from the repository root:
+
+```powershell
+cd backend
+npm start
+```
+
+In a second terminal from the repository root, start the existing Python voice
+worker in browser input mode (Python 3.10–3.12 and
+`voice/requirements.txt` are still required):
 
 ```powershell
 $env:AURA_BACKEND = "http://127.0.0.1:5000"
+$env:AURA_BROWSER_VOICE = "1"
+# Optional; the browser Vite proxy defaults to this loopback port.
+$env:AURA_BROWSER_VOICE_PORT = "5002"
 .\.venv\Scripts\python.exe voice\voice.py
 ```
 
-Stop the standalone voice worker with `Ctrl+C`. From `desktop`, build and serve
-the same React UI in a browser with `npm run build` followed by
-`npm run preview -- --host 127.0.0.1`. The UI uses the existing authentication,
-HTTP/SSE, and WebSocket endpoints; native notifications and voice-process
-controls remain desktop-only.
+In a third terminal:
+
+```powershell
+cd desktop
+npm run dev:https
+```
+
+On first run the script creates a localhost development certificate and trusts
+it for the current Windows user. Open **https://localhost:5173** and sign in.
+Browser voice requires this HTTPS address. The Vite server proxies `/api` and
+the existing WebSocket event stream to backend Core, and proxies authenticated
+audio clips to the Python worker on loopback. The bridge accepts only audio
+uploads up to 20 MB and has no process or filesystem control API. Browser
+recordings stop after 25 seconds. Voice output uses the existing worker TTS and
+plays through the computer’s audio output.
+
+The browser client can also run without voice using `npm run build` and
+`npm run preview`. It continues to use AURA’s existing authentication,
+HTTP/SSE, WebSocket, timer, reminder, and diagnostics contracts.
+
+Troubleshooting browser voice:
+
+- If HTTPS shows a certificate warning, rerun `npm run dev:https` from
+  `desktop`. Delete `desktop/certs/` and rerun that command to regenerate the
+  certificate.
+- If microphone access is denied, allow microphone access for `localhost` in
+  browser site settings, then reload the HTTPS page.
+- If the voice worker shows disconnected, confirm the second terminal is still
+  running with `AURA_BROWSER_VOICE=1`; its health endpoint is proxied locally.
+- If Core is unavailable, start the backend and confirm MongoDB is ready. Audio
+  uploads validate the browser JWT through Core’s existing profile API.
 
 ---
 

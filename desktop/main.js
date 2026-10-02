@@ -503,6 +503,8 @@ function startVoice() {
       ...process.env,
       // Pass backend URL so voice.py doesn't need a hardcoded port
       AURA_BACKEND: `http://localhost:${BACKEND_PORT}`,
+      // Browser audio mode is opt-in for a separately launched dev worker.
+      AURA_BROWSER_VOICE: "0",
     },
     stdio:       ["pipe", "pipe", "pipe"],   // stdin must be pipe for PAUSE/RESUME commands
     windowsHide: true,

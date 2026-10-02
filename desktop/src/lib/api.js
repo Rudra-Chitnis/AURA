@@ -1,8 +1,12 @@
 // ── API client — connects to existing Express backend ──────────────────────
 
 let _token  = typeof window !== "undefined" ? window.localStorage?.getItem("aura_token") : null;
+const _usesViteProxy = typeof window !== "undefined" && !window.aura && window.location.port === "5173";
+const _savedBrowserBackend = typeof window !== "undefined" ? window.localStorage?.getItem("aura_browser_backend") : null;
 let _baseUrl = typeof window !== "undefined" && !window.aura
-  ? window.localStorage?.getItem("aura_browser_backend") || "http://localhost:5000"
+  ? (_usesViteProxy && window.location.protocol === "https:" && /^http:\/\/(localhost|127\.0\.0\.1):5000\/?$/i.test(_savedBrowserBackend || "")
+    ? window.location.origin
+    : _savedBrowserBackend || (_usesViteProxy ? window.location.origin : "http://localhost:5000"))
   : "http://localhost:5000";
 
 export const setToken   = (t) => {

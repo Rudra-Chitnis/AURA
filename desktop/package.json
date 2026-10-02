@@ -8,6 +8,7 @@
   "main": "main.js",
   "scripts": {
     "dev": "concurrently -k -n VITE,ELECTRON -c cyan,magenta \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "dev:https": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-browser-https.ps1",
     "build": "vite build",
     "dist": "vite build && electron-builder",
     "start": "electron .",

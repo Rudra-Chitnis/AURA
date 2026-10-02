@@ -5,6 +5,7 @@ import {
 } from "./lib/api";
 import useBrowserRuntime from "./hooks/useBrowserRuntime";
 import "./browser.css";
+import "./browser-dark.css";
 
 const NAV_ITEMS = [
   { id: "chat", label: "Assistant", icon: "✳" },
@@ -24,6 +25,18 @@ const shortTime = value => {
   if (!value) return "Just now";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "Just now" : date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+};
+
+const isLocalHttpsDev = () => window.location.port === "5173" && window.location.protocol === "https:";
+const getBrowserBackendDefault = () => {
+  const saved = localStorage.getItem("aura_browser_backend");
+  if (isLocalHttpsDev() && (!saved || /^http:\/\/(localhost|127\.0\.0\.1):5000\/?$/i.test(saved))) return window.location.origin;
+  return saved || (window.location.port === "5173" ? window.location.origin : "http://localhost:5000");
+};
+const getBrowserWsDefault = () => {
+  const saved = localStorage.getItem("aura_browser_ws");
+  if (isLocalHttpsDev() && (!saved || /^ws:\/\/(localhost|127\.0\.0\.1):5001\/?$/i.test(saved))) return `wss://${window.location.host}/aura-ws`;
+  return saved || (window.location.port === "5173" ? `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/aura-ws` : "ws://localhost:5001");
 };
 
 const localDateTime = offset => {
@@ -159,7 +172,137 @@ function MessageBubble({ message }) {
   );
 }
 
-function ChatView({ messages, historyLoading, historyError, sendMessage, streaming, abortTurn, user }) {
+function BrowserVoicePanel({ backendStatus, lastVoice, generating, onActivity }) {
+  const [workerStatus, setWorkerStatus] = useState("checking");
+  const [recording, setRecording] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+  const recorderRef = useRef(null);
+  const streamRef = useRef(null);
+  const chunksRef = useRef([]);
+  const cancelledRef = useRef(false);
+  const stopTimerRef = useRef(null);
+  const secure = typeof window !== "undefined" && window.isSecureContext;
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer;
+    const check = async () => {
+      try {
+        const response = await fetch("/__aura_voice/health", { signal: AbortSignal.timeout(2500), cache: "no-store" });
+        const body = await response.json();
+        if (!cancelled) setWorkerStatus(response.ok && body.ready ? "online" : "offline");
+      } catch {
+        if (!cancelled) setWorkerStatus("offline");
+      }
+    };
+    check();
+    timer = setInterval(check, 4000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, []);
+
+  useEffect(() => () => {
+    clearTimeout(stopTimerRef.current);
+    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+    streamRef.current?.getTracks().forEach(track => track.stop());
+  }, []);
+
+  const releaseMicrophone = () => {
+    clearTimeout(stopTimerRef.current);
+    streamRef.current?.getTracks().forEach(track => track.stop());
+    streamRef.current = null;
+    recorderRef.current = null;
+    setRecording(false);
+  };
+
+  const beginRecording = async () => {
+    setError("");
+    cancelledRef.current = false;
+    if (!secure || !navigator.mediaDevices?.getUserMedia) {
+      setError("Microphone access requires the local HTTPS address. Open https://localhost:5173.");
+      return;
+    }
+    if (workerStatus !== "online") {
+      setError("The Python voice worker is offline. Start it using the browser voice command in README.");
+      return;
+    }
+    if (backendStatus !== "online") {
+      setError("AURA Core is unavailable. Reconnect the backend before sending voice.");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      const preferred = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+      const mimeType = preferred.find(type => window.MediaRecorder?.isTypeSupported(type));
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      streamRef.current = stream;
+      recorderRef.current = recorder;
+      chunksRef.current = [];
+      recorder.ondataavailable = event => { if (event.data?.size) chunksRef.current.push(event.data); };
+      recorder.onerror = () => { cancelledRef.current = true; chunksRef.current = []; setError("Browser audio capture failed. Check microphone permissions and try again."); releaseMicrophone(); };
+      recorder.onstop = async () => {
+        const blob = new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" });
+        releaseMicrophone();
+        if (cancelledRef.current) { cancelledRef.current = false; return; }
+        if (!blob.size) { setError("No audio was captured. Check your microphone and try again."); return; }
+        setUploading(true);
+        try {
+          const response = await fetch("/__aura_voice/audio", {
+            method: "POST",
+            headers: { "Content-Type": blob.type, Authorization: `Bearer ${getToken()}` },
+            body: blob,
+          });
+          const body = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(body.error || `Voice worker returned HTTP ${response.status}.`);
+          onActivity({ type: "voice", state: "processing", text: "Browser recording sent to the AURA voice pipeline." });
+        } catch (uploadError) {
+          setError(uploadError.message || "Could not send audio to the voice worker.");
+        } finally {
+          setUploading(false);
+        }
+      };
+      recorder.start(250);
+      setRecording(true);
+      stopTimerRef.current = setTimeout(() => {
+        if (recorder.state === "recording") recorder.stop();
+      }, 25000);
+    } catch (captureError) {
+      const denied = captureError.name === "NotAllowedError" || captureError.name === "SecurityError";
+      setError(denied
+        ? "Microphone permission was denied. Allow microphone access for localhost in your browser’s site settings."
+        : captureError.message || "Could not access a microphone on this device.");
+      releaseMicrophone();
+    }
+  };
+
+  const voiceStatus = workerStatus === "checking" ? "connecting"
+    : workerStatus !== "online" ? "disconnected"
+      : error ? "error" : recording ? "listening" : uploading ? "processing"
+        : generating ? "generating"
+          : lastVoice?.state === "thinking" ? "processing"
+            : lastVoice?.state === "speaking" ? "speaking"
+              : backendStatus === "online" ? "ready" : "disconnected";
+
+  return (
+    <section className={`browser-voice-console web-card voice-${voiceStatus}`} aria-live="polite">
+      <div className="browser-voice-orb" aria-hidden="true"><span>✳</span><i /><i /><i /></div>
+      <div className="browser-voice-content">
+        <p className="browser-eyebrow">AURA VOICE <span className={`voice-state-tag ${voiceStatus}`}>{voiceStatus}</span></p>
+        <h3>{recording ? "Listening to you" : uploading || voiceStatus === "processing" ? "Processing your voice" : voiceStatus === "generating" ? "AURA is generating a response" : voiceStatus === "speaking" ? "AURA is speaking" : voiceStatus === "connecting" ? "Connecting to voice worker" : voiceStatus === "disconnected" && workerStatus === "online" ? "AURA Core unavailable" : voiceStatus === "disconnected" ? "Voice worker disconnected" : voiceStatus === "error" ? "Voice needs attention" : voiceStatus === "listening" ? "Voice worker is listening" : "Talk to AURA"}</h3>
+        <p>{error || (workerStatus !== "online" ? "Start the Python browser voice worker to enable microphone input." : backendStatus !== "online" ? "Core must be ready before voice can be sent." : recording ? "Speak naturally, then finish or wait for the 25 second limit." : voiceStatus === "listening" ? "The voice loop is ready and waiting for a browser recording." : "Your recording is processed by the existing Python Whisper and AURA voice pipeline." )}</p>
+        {lastVoice?.text && <blockquote>{lastVoice.text}</blockquote>}
+        <div className="browser-voice-actions">
+          {recording
+            ? <><button type="button" className="web-button voice-submit" onClick={() => recorderRef.current?.stop()}>Finish & send</button><button type="button" className="web-button secondary" onClick={() => { cancelledRef.current = true; chunksRef.current = []; recorderRef.current?.stop(); }}>Cancel</button></>
+            : <button type="button" className="web-button voice-submit" onClick={beginRecording} disabled={uploading || generating || workerStatus !== "online" || backendStatus !== "online"}><span className="voice-mic-icon">●</span>{uploading ? "Sending audio…" : generating ? "Wait for response" : workerStatus === "online" ? "Start speaking" : "Voice worker offline"}</button>}
+          <span className="browser-voice-worker"><StatusDot status={workerStatus} /> Python {workerStatus}</span>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function ChatView({ messages, historyLoading, historyError, sendMessage, streaming, abortTurn, user, voicePanel }) {
   const [draft, setDraft] = useState("");
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
@@ -180,6 +323,7 @@ function ChatView({ messages, historyLoading, historyError, sendMessage, streami
     <div className="browser-chat-layout">
       <main className="browser-chat-main">
         <div className="browser-page-header chat-header"><div><p className="browser-eyebrow">AURA · PERSONAL ASSISTANT</p><h1>{hasMessages ? `Welcome back${user?.name ? `, ${user.name.split(" ")[0]}` : ""}.` : "A little more clarity, on demand."}</h1><p className="browser-muted">A local assistant that learns from your conversations and helps you move forward.</p></div><div className="browser-session-chip"><span className="session-orb">✳</span><span><b>Private session</b><small>Connected to your Core</small></span></div></div>
+        {voicePanel}
         <section className="browser-conversation" aria-label="Conversation">
           <div className="browser-message-scroll" aria-live="polite">
             {historyLoading ? <div className="browser-history-loading"><span className="web-spinner" /> Restoring your conversation…</div> : !hasMessages ? (
@@ -351,7 +495,7 @@ function SettingsView({ backendUrl, wsUrl, setEndpoints, user, onLogout }) {
       <div className="browser-page-header"><div><p className="browser-eyebrow">PREFERENCES</p><h1>Settings</h1><p className="browser-muted">Connect this browser to the Core instance you want to work with.</p></div></div>
       <div className="settings-grid"><form className="browser-content-card browser-form-card" onSubmit={save}><p className="browser-eyebrow">CONNECTION</p><h2>Core endpoints</h2><p className="browser-muted">Changes are saved in this browser only. Use the Core HTTP and WebSocket ports.</p><label>Backend HTTP URL<input required type="url" value={httpDraft} onChange={event => setHttpDraft(event.target.value)} placeholder="http://localhost:5000" /></label><label>WebSocket URL<input required type="url" value={wsDraft} onChange={event => setWsDraft(event.target.value)} placeholder="ws://localhost:5001" /></label><button className="web-button primary" type="submit">{saved ? "Saved · reconnecting" : "Save connection"}</button></form>
         <section className="browser-content-card account-card"><p className="browser-eyebrow">ACCOUNT</p><h2>{user?.name || "Your AURA account"}</h2><p className="browser-muted">{user?.email || "Signed in to this Core instance."}</p><div className="account-security"><span>◆</span><p><b>Token stored in this browser</b><small>Authentication uses AURA's existing JWT API.</small></p></div><button className="web-button danger-outline" onClick={onLogout}>Sign out</button></section>
-        <section className="browser-content-card about-card"><p className="browser-eyebrow">ABOUT THIS CLIENT</p><h2>Browser client</h2><p className="browser-muted">Chat history is loaded from Core. Runtime timers, reminders, activity, and diagnostics use the existing AURA API/event contracts.</p><div className="about-contracts"><span>HTTP + SSE</span><span>WebSocket</span><span>JWT auth</span></div><p className="web-voice-note-static">Voice control and native notifications remain in the desktop host. Voice worker events are still visible here when Core receives them.</p></section>
+        <section className="browser-content-card about-card"><p className="browser-eyebrow">ABOUT THIS CLIENT</p><h2>Browser client</h2><p className="browser-muted">Chat history is loaded from Core. Runtime timers, reminders, activity, and diagnostics use the existing AURA API/event contracts.</p><div className="about-contracts"><span>HTTP + SSE</span><span>WebSocket</span><span>JWT auth</span></div><p className="web-voice-note-static">Browser voice requires the local HTTPS development URL and the optional Python voice worker. Audio runs through AURA’s existing Whisper, intent, Core, and TTS path.</p></section>
       </div>
     </section>
   );
@@ -366,8 +510,8 @@ function BrowserApp() {
   const [user, setUser] = useState(null);
   const [authChecking, setAuthChecking] = useState(Boolean(getToken()));
   const [authError, setAuthError] = useState("");
-  const [backendUrl, setBackendUrl] = useState(() => localStorage.getItem("aura_browser_backend") || "http://localhost:5000");
-  const [wsUrl, setWsUrl] = useState(() => localStorage.getItem("aura_browser_ws") || "ws://localhost:5001");
+  const [backendUrl, setBackendUrl] = useState(getBrowserBackendDefault);
+  const [wsUrl, setWsUrl] = useState(getBrowserWsDefault);
   const [view, setView] = useState("chat");
   const [messages, setMessages] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -511,7 +655,7 @@ function BrowserApp() {
       <main className="browser-main">
         <header className="browser-topbar"><div className="mobile-brand"><BrandMark /><b>AURA</b></div><div className="browser-breadcrumb"><span>Workspace</span><i>/</i><b>{pageTitle}</b></div><div className="browser-top-status"><span className="top-connection"><StatusDot status={backend.status} /> Core <b>{backend.status}</b></span><span className="top-connection"><StatusDot status={socket} /> Events <b>{socket}</b></span><button className="web-icon-button settings-shortcut" onClick={() => setView("settings")} aria-label="Open settings">⚙</button></div></header>
         <div className="browser-page-content">
-          {view === "chat" && <ChatView messages={messages} historyLoading={historyLoading} historyError={historyError} sendMessage={sendMessage} streaming={streaming} abortTurn={() => turnController?.abort()} user={user} />}
+          {view === "chat" && <ChatView messages={messages} historyLoading={historyLoading} historyError={historyError} sendMessage={sendMessage} streaming={streaming} abortTurn={() => turnController?.abort()} user={user} voicePanel={<BrowserVoicePanel backendStatus={backend.status} lastVoice={lastVoice} generating={streaming} onActivity={addActivity} />} />}
           {view === "activity" && <ActivityView activity={activity} onClear={clearActivity} onInspect={inspectActivity} />}
           {view === "routines" && <RoutinesView runtime={runtime} now={now} dispatchAction={runAction} activity={activity} onInspect={inspectActivity} />}
           {view === "diagnostics" && <DiagnosticsView diagnostics={diagnostics} activity={activity} onRefresh={refreshDiagnostics} onInspect={inspectActivity} />}
@@ -519,7 +663,7 @@ function BrowserApp() {
         </div>
         <footer className="browser-footer"><span><StatusDot status={socket} /> {connectionStatus}</span><span>{backend.body?.ok ? "MongoDB ready" : backend.status === "degraded" ? backend.body?.reason || "Backend degraded" : "Core health from /api/health"}</span><span className="footer-right">AURA · browser client</span></footer>
       </main>
-      {view === "chat" && <aside className="browser-chat-rail"><StatusCard backend={backend} socket={socket} runtime={runtime} ollama={ollama} lastVoice={lastVoice} /><QuickRuntime runtime={runtime} onNavigate={setView} /><AppActivityRail activity={activity} onNavigate={setView} onInspect={inspectActivity} /><section className="browser-voice-card web-card"><div className="browser-voice-mark"><span>◖</span><i /><i /></div><div><b>Voice is on desktop</b><p>Voice worker events show up here; browser microphone control is not available.</p></div></section></aside>}
+      {view === "chat" && <aside className="browser-chat-rail"><StatusCard backend={backend} socket={socket} runtime={runtime} ollama={ollama} lastVoice={lastVoice} /><QuickRuntime runtime={runtime} onNavigate={setView} /><AppActivityRail activity={activity} onNavigate={setView} onInspect={inspectActivity} /></aside>}
       {selectedActivity && <div className="web-inspector-backdrop" role="presentation" onClick={() => setSelectedActivity(null)}><section className="web-inspector" role="dialog" aria-modal="true" aria-label="Activity details" onClick={event => event.stopPropagation()}><div className="web-inspector-head"><div><p className="browser-eyebrow">{selectedActivity.category || "EVENT"} · {shortTime(selectedActivity.createdAt)}</p><h2>{selectedActivity.title}</h2><p className="browser-muted">{selectedActivity.detail}</p></div><button className="web-icon-button" onClick={() => setSelectedActivity(null)} aria-label="Close details">×</button></div><pre>{JSON.stringify(selectedActivity.payload || selectedActivity, null, 2)}</pre></section></div>}
       {toast && <div role="status" className="browser-toast"><span>!</span>{toast}</div>}
     </div>

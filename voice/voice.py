@@ -19,6 +19,7 @@ import subprocess
 import webbrowser
 import urllib.parse
 import requests
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sounddevice as sd
 import numpy as np
 import scipy.io.wavfile as wav
@@ -81,6 +82,14 @@ _playback_interrupt = threading.Event()  # set by interrupt monitor when user sp
 _paused             = threading.Event()  # set by stdin monitor when Electron sends PAUSE command
 _sleeping           = threading.Event()  # set when AURA enters sleep/goodbye idle — cleared by WAKE
 _should_quit        = threading.Event()  # set by QUIT stdin command; checked in main loop for clean exit
+
+# Optional loopback bridge for browser development. The browser captures audio
+# only after a user gesture; this worker feeds the received clip through the
+# same Whisper, intent, Core, and TTS path used by desktop microphone capture.
+_BROWSER_VOICE_MODE = os.environ.get("AURA_BROWSER_VOICE", "").lower() in ("1", "true", "yes")
+_BROWSER_VOICE_PORT = int(os.environ.get("AURA_BROWSER_VOICE_PORT", "5002"))
+_browser_audio_queue: _queue.Queue = _queue.Queue(maxsize=1)
+_browser_voice_server = None
 
 # Short-term conversation memory — last 20 exchanges (10 Q+A pairs)
 _conversation_history: deque = deque(maxlen=20)
@@ -260,7 +269,7 @@ def ensure_authenticated():
       - If expired or missing, prompt for login interactively.
     """
     global _token
-    _is_electron = not sys.stdin.isatty()
+    _is_electron = _BROWSER_VOICE_MODE or not sys.stdin.isatty()
     token = load_token()
 
     if _is_electron:
@@ -456,6 +465,111 @@ def _stdin_monitor():
                     threading.Thread(target=speak, args=(speak_text,), daemon=True).start()
     except (EOFError, OSError):
         pass  # stdin closed — normal on Electron shutdown
+
+
+def _start_browser_voice_bridge():
+    """Start a loopback-only, audio-ingest endpoint for the HTTPS dev client."""
+    global _browser_voice_server
+
+    class BrowserVoiceHandler(BaseHTTPRequestHandler):
+        server_version = "AURA-Voice-Bridge"
+        _max_audio_bytes = 20 * 1024 * 1024
+        _audio_suffixes = {
+            "audio/webm": ".webm",
+            "audio/ogg": ".ogg",
+            "audio/wav": ".wav",
+            "audio/x-wav": ".wav",
+            "audio/mp4": ".m4a",
+        }
+
+        def log_message(self, _format, *_args):
+            return
+
+        def _respond(self, status, payload):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path != "/health":
+                return self._respond(404, {"error": "not_found"})
+            self._respond(200, {"ready": True, "mode": "browser-audio"})
+
+        def do_POST(self):
+            if self.path != "/audio":
+                return self._respond(404, {"error": "not_found"})
+
+            authorization = self.headers.get("Authorization", "")
+            scheme, _, token = authorization.partition(" ")
+            if scheme.lower() != "bearer" or not token.strip():
+                return self._respond(401, {"error": "AURA sign-in is required."})
+
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            suffix = self._audio_suffixes.get(content_type)
+            if not suffix:
+                return self._respond(415, {"error": "Use a supported browser audio format."})
+
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return self._respond(400, {"error": "Invalid audio length."})
+            if content_length <= 0 or content_length > self._max_audio_bytes:
+                return self._respond(413, {"error": "Audio must be between 1 byte and 20 MB."})
+
+            # Confirm the supplied browser session against the existing Core API.
+            try:
+                profile = requests.get(
+                    f"{BACKEND}/api/auth/profile",
+                    headers={"Authorization": f"Bearer {token.strip()}"},
+                    timeout=4,
+                )
+            except requests.RequestException:
+                return self._respond(503, {"error": "AURA Core is unavailable."})
+            if profile.status_code != 200:
+                return self._respond(401, {"error": "Your AURA session is no longer valid."})
+
+            audio_path = None
+            try:
+                with tempfile.NamedTemporaryFile(prefix="aura-browser-", suffix=suffix, delete=False) as audio_file:
+                    audio_path = audio_file.name
+                    remaining = content_length
+                    while remaining:
+                        chunk = self.rfile.read(min(64 * 1024, remaining))
+                        if not chunk:
+                            raise OSError("Browser audio upload ended early.")
+                        audio_file.write(chunk)
+                        remaining -= len(chunk)
+                _browser_audio_queue.put_nowait((audio_path, token.strip()))
+            except _queue.Full:
+                if audio_path:
+                    try: os.unlink(audio_path)
+                    except OSError: pass
+                return self._respond(409, {"error": "AURA is still processing the previous recording."})
+            except OSError as error:
+                if audio_path:
+                    try: os.unlink(audio_path)
+                    except OSError: pass
+                return self._respond(400, {"error": str(error)})
+
+            self._respond(202, {"accepted": True})
+
+    _browser_voice_server = ThreadingHTTPServer(("127.0.0.1", _BROWSER_VOICE_PORT), BrowserVoiceHandler)
+    threading.Thread(target=_browser_voice_server.serve_forever, name="browser-voice-http", daemon=True).start()
+    print(f"[voice] Browser audio bridge ready on 127.0.0.1:{_BROWSER_VOICE_PORT}", flush=True)
+
+
+def _wait_for_browser_audio():
+    """Wait for an authenticated browser clip, while remaining quit-responsive."""
+    while not _should_quit.is_set():
+        try:
+            return _browser_audio_queue.get(timeout=0.4)
+        except _queue.Empty:
+            continue
+    return None, None
 
 
 # ─────────────────────────────────────────────
@@ -3622,10 +3736,16 @@ if __name__ == "__main__":
     # ── Detect Electron mode FIRST ────────────────────────────────────────────
     # Must happen before ensure_authenticated() so that function never calls
     # input() when stdin is an Electron IPC pipe.
-    AUTO_MODE = not sys.stdin.isatty()
+    AUTO_MODE = _BROWSER_VOICE_MODE or not sys.stdin.isatty()
 
     ensure_authenticated()
     load_models()
+    if _BROWSER_VOICE_MODE:
+        try:
+            _start_browser_voice_bridge()
+        except OSError as bridge_error:
+            print(f"[voice] Browser audio bridge failed to start: {bridge_error}", flush=True)
+            _push_event({"type": "voice", "state": "error", "text": "Browser voice service could not start."})
 
     # ── Restore conversation history (P2.4) ──────────────────────────────────
     # Load the last session's turns from MongoDB before the greeting plays.
@@ -3763,7 +3883,16 @@ if __name__ == "__main__":
 
         dbg.loop_state("LISTENING")
         _push_event({"type": "voice", "state": "listening"})
-        speech_detected = record_audio()
+        browser_audio_path = None
+        if _BROWSER_VOICE_MODE:
+            browser_audio_path, browser_token = _wait_for_browser_audio()
+            if browser_audio_path is None:
+                break
+            _token = browser_token
+            _load_history_if_needed()
+            speech_detected = True
+        else:
+            speech_detected = record_audio()
 
         if not speech_detected:
             # VAD saw no energy above threshold — pre-speech timeout fired.
@@ -3775,7 +3904,14 @@ if __name__ == "__main__":
         # Speech detected — now transcribe
         dbg.loop_state("TRANSCRIBING")
         _push_event({"type": "voice", "state": "thinking"})
-        text = transcribe_audio()
+        if browser_audio_path:
+            try:
+                text = transcribe_audio(browser_audio_path)
+            finally:
+                try: os.unlink(browser_audio_path)
+                except OSError: pass
+        else:
+            text = transcribe_audio()
 
         if not text:
             print("(Nothing clear detected — try again)")
