@@ -566,7 +566,7 @@ function startVoice() {
       if (timerMatch) {
         const secs  = parseInt(timerMatch[1], 10);
         const label = timerMatch[2].trim();
-        auraRuntime?.timers.setTimer(label, secs);
+        auraRuntime?.actions.dispatch({ type: "timer.create", label, seconds: secs });
         if (auraRuntime) safeSend("timer-tick", auraRuntime.timers.listTimers());
         console.log(`[AURA] Timer registered via voice: "${label}" ${secs}s`);
       }
@@ -577,7 +577,7 @@ function startVoice() {
       if (reminderMatch) {
         const text   = reminderMatch[1].trim();
         const fireAt = reminderMatch[2].trim();
-        auraRuntime?.reminders.setReminder(text, fireAt);
+        auraRuntime?.actions.dispatch({ type: "reminder.create", text, fireAt });
         console.log(`[AURA] Reminder registered via voice: "${text}" at ${fireAt}`);
       }
 
@@ -856,12 +856,12 @@ function _speakViaVoice(text) {
 
 // ── timer IPC handlers ────────────────────────────────────────────────────────
 ipcMain.handle("set-timer", (_, { label, seconds }) => {
-  const timer = auraRuntime.timers.setTimer(label, seconds);
+  const { result: timer } = auraRuntime.actions.dispatch({ type: "timer.create", label, seconds });
   safeSend("timer-tick", auraRuntime.timers.listTimers());
   return timer;
 });
 ipcMain.handle("cancel-timer", (_, id) => {
-  auraRuntime.timers.cancelTimer(id);
+  auraRuntime.actions.dispatch({ type: "timer.cancel", id });
   safeSend("timer-tick", auraRuntime.timers.listTimers());
   return true;
 });
@@ -869,11 +869,11 @@ ipcMain.handle("list-timers", () => auraRuntime?.timers.listTimers() || []);
 
 // ── reminder IPC handlers ─────────────────────────────────────────────────────
 ipcMain.handle("set-reminder",    (_, { text, fireAt }) => {
-  const r = auraRuntime.reminders.setReminder(text, fireAt);
+  const { result: r } = auraRuntime.actions.dispatch({ type: "reminder.create", text, fireAt });
   return r;
 });
 ipcMain.handle("cancel-reminder", (_, id) => {
-  auraRuntime.reminders.cancelReminder(id);
+  auraRuntime.actions.dispatch({ type: "reminder.cancel", id });
   return true;
 });
 ipcMain.handle("list-reminders",  () => auraRuntime?.reminders.listReminders() || []);

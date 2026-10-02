@@ -4,6 +4,7 @@ const { EventEmitter } = require("events");
 const { TimerManager } = require("./timerManager");
 const { ReminderManager } = require("./reminderManager");
 const { RuntimeLifecycle } = require("./runtimeLifecycle");
+const { DeterministicActionRouter } = require("./deterministicActionRouter");
 
 // Headless runtime composition used by the desktop shell. This module has no
 // dependency on Electron; the host supplies its persistent data directory.
@@ -16,6 +17,10 @@ class AuraRuntime extends EventEmitter {
     this.state = "stopped";
     this.timers = new TimerManager({ dataDirectory, events: this });
     this.reminders = new ReminderManager({ dataDirectory, events: this });
+    this.actions = new DeterministicActionRouter({
+      timers: this.timers,
+      reminders: this.reminders,
+    });
   }
 
   start() {
