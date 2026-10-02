@@ -15,22 +15,34 @@ contracts unless listed below.
 
 ```text
 Electron renderer
-  ├─ window.aura IPC adapter ──> desktop/main.js ──> desktop/core/AuraRuntime
+  ├─ window.aura IPC adapter ──> desktop/main.js ──HTTP──> backend/core/AuraRuntime
   └─ HTTP/SSE + WebSocket ──> backend routes/wsHub ──> backend/core/AuraRuntime
 
 Python voice
-  ├─ stdout protocol ──> Electron main ──> desktop Core actions
-  ├─ HTTP POST /api/events/push ──> backend event route/Core router ──> wsHub
-  └─ authenticated HTTP APIs ──> backend routes/services
+  ├─ HTTP ──> backend Core turns/actions/events
+  ├─ compatibility stdout markers ──> Electron main ──HTTP──> backend Core
+  └─ process-control stdout/stdin ──> Electron main
 ```
 
-The two current `AuraRuntime` compositions are host-local: the desktop runtime
-composes timers, reminders, deterministic timer/reminder actions, lifecycle
-phase storage, readiness probes, and process coordination. The backend runtime
-composes conversation-turn access and diagnostic/event routing. They are not a
-single process or a single exported network API today.
+The backend `AuraRuntime` is the application Core composition and is hosted by
+`backend/server.js`, which can run without Electron. It composes conversation,
+existing AI/memory/semantic-learning services, diagnostics, deterministic
+actions, timer/reminder scheduling, and runtime state. Electron retains a
+separate host lifecycle object for desktop startup phases and process
+coordination; it does not own a second timer/reminder runtime.
 
-Intended future direction (not yet implemented as a universal API):
+Headless start command:
+
+```sh
+cd backend && npm start
+```
+
+The default backend Core data directory is `~/.aura-core`; Electron passes its
+existing user-data directory through `AURA_DATA_DIR` to preserve existing JSON
+timer/reminder files. The backend uses `PORT` (default 5000) and WebSocket port
+5001.
+
+The architectural direction remains:
 
 ```text
 Client -> Core API/events
@@ -47,8 +59,8 @@ later migration changes them deliberately.
 
 | Current interface | Current contract |
 |---|---|
-| Desktop `AuraRuntime.start()` / `stop()` | Emits in-process `runtime:state` with string values `starting`, `ready`, and `stopped`; repeated start while ready and repeated stop while stopped are no-ops. |
-| `AuraRuntime.getState()` | Returns `{ state, timers, reminders }`; this is an in-process snapshot, not currently a public HTTP or WebSocket response. |
+| Backend `AuraRuntime.start()` / `stop()` | Owns timer/reminder scheduling lifecycle and emits in-process `runtime:state` values `starting`, `ready`, and `stopped`; repeated start while ready and repeated stop while stopped are no-ops. |
+| Backend `GET /api/runtime/state` | Returns `{ state, timers, reminders }`. Loopback requests are local-client accessible; non-loopback requests pass the existing authentication middleware. |
 | `setStartupPhase(phase)` / `getStartupPhase()` | Stores and returns a host-provided string. No enum validation is enforced. |
 | Runtime process coordinator callbacks | Coordinate backend/voice process startup, restart, readiness and shutdown through callbacks supplied by Electron. These are internal orchestration methods, not a client API. |
 
@@ -82,7 +94,7 @@ not conversation Core contracts.
 
 ### Deterministic actions, timers and desktop reminders
 
-The current normalized action requests accepted by the desktop Core router are:
+The current normalized action requests accepted by the backend Core router are:
 
 | Request `type` | Inputs | Result |
 |---|---|---|
@@ -93,12 +105,14 @@ The current normalized action requests accepted by the desktop Core router are:
 
 An absent request, a request without a string `type`, or an unknown `type`
 returns `{ handled: false }`. The router does not validate action-specific
-fields for recognized types. These are current in-process Core operation
-shapes; callers are Electron IPC handlers and the voice stdout adapter, not a
-public HTTP action endpoint.
+fields for recognized types. These remain in-process Core operation shapes.
+`POST /api/runtime/actions` accepts the normalized request body and returns the
+same dispatch result; Electron IPC and Python voice use that route for
+timer/reminder operations.
 
 The runtime persists desktop timers in `timers.json` and desktop reminders in
-`reminders.json` under Electron's user data directory. Timer list entries add
+`reminders.json` under `AURA_DATA_DIR` (Electron sets this to the existing
+user-data directory; standalone backend defaults to `~/.aura-core`). Timer list entries add
 `remainingSecs`. Desktop Core emits these in-process events:
 
 | Event | Payload |
@@ -108,7 +122,8 @@ The runtime persists desktop timers in `timers.json` and desktop reminders in
 | `reminder:updated` | Array of current desktop reminder records. |
 | `reminder:fired` | `{ reminder, body, wasMissed }`. |
 
-Electron adapts these to IPC `timer-tick`, `timer-fired`, `reminder-updated`,
+The backend event adapter broadcasts renderer-compatible WebSocket envelopes.
+Electron relays those events to IPC `timer-tick`, `timer-fired`, `reminder-updated`,
 and `reminder-fired`. The fired IPC payloads are reduced to `{ id, label, text }`
 for timers and `{ id, text, body }` for reminders. Notification display and
 voice delivery are additional Electron-side effects. These in-process Core
@@ -199,10 +214,10 @@ window controls and settings IPC are likewise host/UI concerns.
 
 ### Voice stdout protocol
 
-The voice process communicates timer/reminder creation to Electron using
-`AURA:SET_TIMER:<seconds>:<label>` and
-`AURA:SET_REMINDER:<text>:<ISO timestamp>`. Electron parses those lines and
-dispatches the matching normalized Core action. Other observed lifecycle
+The voice process posts timer/reminder operations directly to
+`POST /api/runtime/actions`. It retains the `AURA:SET_TIMER:<seconds>:<label>`
+and `AURA:SET_REMINDER:<text>:<ISO timestamp>` stdout markers as a fallback;
+Electron still parses those compatibility lines. Other observed lifecycle
 signals include `AURA:VOICE_READY`, `AURA:SLEEPING`, and `AURA:AWAKE`; they are
 still interpreted by Electron. These line formats are a current process
 protocol, not Core API events.
@@ -210,13 +225,13 @@ protocol, not Core API events.
 ## Internal implementation details (not public contracts)
 
 - EventEmitter names `runtime:state`, `timer:tick`, `timer:fired`,
-  `reminder:updated`, and `reminder:fired` are local to the desktop process.
+  `reminder:updated`, and `reminder:fired` are local to the backend Core process.
 - `RuntimeProcessCoordinator` methods/callbacks and startup retry counters are
   internal; they are not directly exposed to renderer or backend clients.
 - `RuntimeLifecycle` stores arbitrary strings; the observed phase strings are
   conventions rather than an enforced enum.
-- Backend `AuraRuntime` exposes implementation methods in process. It does not
-  currently expose one network API shared by desktop Core and backend Core.
+- Backend `AuraRuntime` exposes composed capabilities in process; its runtime
+  state and deterministic actions are exposed to clients by `/api/runtime`.
 - Backend health reports both HTTP process and Mongo readiness as one probe;
   there is no distinct public worker-status event schema today.
 
@@ -244,9 +259,8 @@ protocol, not Core API events.
 The current contracts offer a practical migration target: clients should call
 Core operations and subscribe to Core application events; transport adapters
 should map those contracts to HTTP/WebSocket, Electron IPC, or another client
-transport. Core should coordinate existing workers/providers and persistence
-through explicit boundaries. Today, however, the desktop Core still receives
-its data directory and process callbacks from Electron, backend Core is composed
-inside the backend process, HTTP/WebSocket live in backend adapters, and voice
-stdout is interpreted by Electron. Independent Core execution requires a later
-host/transport composition step; this document alone does not provide it.
+transport. Core coordinates existing services and persistence through the
+backend host; Electron remains responsible for desktop process creation and
+host-specific effects. The backend server is independently runnable, although
+MongoDB remains a required startup dependency and voice process supervision
+remains desktop-owned.

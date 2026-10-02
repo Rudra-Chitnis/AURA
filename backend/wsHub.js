@@ -60,4 +60,12 @@ const getClientCount = () => {
   return [...wss.clients].filter((c) => c.readyState === 1).length;
 };
 
-module.exports = { start, broadcast, getClientCount };
+const stop = () => new Promise(resolve => {
+  if (!wss) return resolve();
+  const current = wss;
+  wss = null;
+  current.clients.forEach(client => client.close());
+  current.close(() => resolve());
+});
+
+module.exports = { start, stop, broadcast, getClientCount };

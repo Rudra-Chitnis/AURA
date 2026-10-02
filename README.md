@@ -53,7 +53,7 @@
 
 AURA is a **personal AI voice assistant** you talk to through your microphone. It understands you, remembers things about you, answers questions, sets timers and reminders, opens apps, plays music, and speaks back in a natural neural voice — like a local, privacy-first Jarvis.
 
-AURA runs as a native **Electron desktop application** on Windows. There is no web dashboard, no terminal interaction, and no manual process management. Everything — the backend, voice pipeline, timers, and reminders — is orchestrated automatically by the desktop app the moment you launch it.
+AURA's primary client is a native **Electron desktop application** on Windows. The backend Core can also run without Electron, and the existing React client can connect through HTTP/WebSocket in a browser. Electron continues to supervise the desktop backend and voice worker and provides native OS integration.
 
 ---
 
@@ -65,7 +65,7 @@ AURA runs as a native **Electron desktop application** on Windows. There is no w
 | *"What do I like to eat?"* | Retrieves your food preferences stored in MongoDB |
 | *"Remember that I'm studying CS at VIT"* | Stores it as a memory with vector embeddings |
 | *"Who is the Prime Minister of India?"* | Answers from Mistral's general knowledge |
-| *"Set a timer for 10 minutes"* | Creates a live desktop countdown — Electron-native, survives restarts |
+| *"Set a timer for 10 minutes"* | Creates a Core-backed live desktop countdown that survives restarts |
 | *"Remind me to study at 9 PM"* | Schedules a desktop notification + spoken reminder |
 | *"Play lofi on Spotify"* | Opens Spotify and navigates to the first result |
 | *"Play Blinding Lights on YouTube"* | Fetches the direct watch URL and auto-plays in browser |
@@ -86,8 +86,7 @@ AURA is built on four layers with clear ownership boundaries:
 │                                                         │
 │  • Orchestrates the full runtime lifecycle              │
 │  • Spawns + supervises backend (Node) + voice (Python)  │
-│  • Owns timers  — Electron TimerManager (JSON-backed)   │
-│  • Owns reminders — Electron ReminderManager            │
+│  • Hosts desktop UI and native OS integration           │
 │  • Owns startup splash screen + phase progression       │
 │  • IPC bridge between main process ↔ React renderer    │
 └────────────────┬────────────────────────────────────────┘
@@ -117,7 +116,7 @@ AURA is built on four layers with clear ownership boundaries:
 IDLE → LISTENING → TRANSCRIBING → THINKING → SPEAKING → IDLE
 ```
 
-Only ONE subsystem owns audio playback at a time. The Electron process is the authoritative runtime supervisor — it is the source of truth for process state, timer state, and reminder state.
+Only ONE subsystem owns audio playback at a time. Electron remains the desktop process supervisor; backend Core is the source of truth for logical timer/reminder state.
 
 ---
 
@@ -169,19 +168,19 @@ AURA uses a lightweight **Retrieval Augmented Generation** memory system:
 
 ## ⏱️ Timer & Reminder System
 
-Timers and reminders are **Electron-native** — owned entirely by the desktop runtime, not by the voice pipeline or backend server.
+Timers and desktop reminders are owned by the backend Core runtime. Electron adapts the Core HTTP/WebSocket interfaces to existing IPC and native notification/voice effects.
 
 | Property | Timer | Reminder |
 |---|---|---|
 | Persistence | `%APPDATA%\AURA\timers.json` | `%APPDATA%\AURA\reminders.json` |
-| Scheduling | `setTimeout` in Electron main | `setTimeout` in Electron main |
+| Scheduling | Backend Core runtime | Backend Core runtime |
 | Survives backend restart | ✅ | ✅ |
 | Survives voice restart | ✅ | ✅ |
 | On fire | OS notification + AURA speaks | OS notification + AURA speaks |
 | UI | Live MM:SS countdown chip | Time-until chip |
 | Startup recovery | Expired timers fire with 1.5s delay | 30-min missed-window recovery |
 
-The voice pipeline signals Electron via stdout: `AURA:SET_TIMER:30:30 seconds`. Electron's TimerManager takes ownership from that point.
+The voice pipeline sends timer/reminder actions directly to backend Core over HTTP. Existing stdout markers remain as compatibility fallbacks.
 
 ---
 
@@ -218,7 +217,7 @@ Heavy queries route to **Mistral 7B**. Lightweight queries use **TinyLlama** for
 
 | Layer | Technology |
 |---|---|
-| Desktop shell | Electron 28 — orchestrates all processes, owns timers/reminders |
+| Desktop shell | Electron 28 — orchestrates desktop processes and adapts Core to native UI/OS |
 | UI renderer | React 18 + Vite + Tailwind CSS — animated orb, transcript display |
 | Voice capture | `sounddevice` — VAD-based, stops on 1.8s silence |
 | Speech to text | `faster-whisper` — `small` model, CPU, int8, `vad_filter=True` |
@@ -262,7 +261,7 @@ AURA/
 │   │   ├── memoryService.js         # RAG search + ABOUT_ME fast path
 │   │   ├── embeddingService.js      # MiniLM-L6-v2 embeddings (pre-warmed)
 │   │   ├── reminderService.js       # Reminder DB operations
-│   │   ├── reminderScheduler.js     # Background poll (legacy, Electron now owns delivery)
+│   │   ├── reminderScheduler.js     # Existing MongoDB reminder scheduler
 │   │   └── logService.js
 │   ├── utils/
 │   │   ├── similarity.js            # Cosine similarity
@@ -292,8 +291,7 @@ AURA/
 │   │       └── useStore.js          # Zustand global state
 │   ├── main.js                      # Electron main process — process orchestration
 │   ├── preload.js                   # Context bridge — IPC channels exposed to renderer
-│   ├── timerManager.js              # Electron-native timer system (JSON persistence)
-│   ├── reminderManager.js           # Electron-native reminder system (JSON persistence)
+│   ├── adapters/runtimeIpcAdapter.js # Existing IPC adapter to backend Core
 │   ├── vite.config.js
 │   └── package.json
 │
@@ -430,6 +428,33 @@ start-dev.bat
 
 This opens three terminals: backend (nodemon), Vite dev server, and Electron (which waits for Vite to be ready).
 
+### Headless Core and browser client
+
+Start the backend Core without Electron:
+
+```bat
+cd backend
+npm start
+```
+
+The backend initializes the existing MongoDB services, HTTP API, WebSocket hub,
+and timer/reminder runtime. Stop it with `Ctrl+C`; it handles SIGINT/SIGTERM and
+closes the HTTP/WebSocket servers and persistence connection. To start the
+desktop adapter, run `cd desktop` then `npm start` (it starts its managed backend
+and voice worker as before). To run voice independently from the repository
+root, use PowerShell:
+
+```powershell
+$env:AURA_BACKEND = "http://127.0.0.1:5000"
+.\.venv\Scripts\python.exe voice\voice.py
+```
+
+Stop the standalone voice worker with `Ctrl+C`. From `desktop`, build and serve
+the same React UI in a browser with `npm run build` followed by
+`npm run preview -- --host 127.0.0.1`. The UI uses the existing authentication,
+HTTP/SSE, and WebSocket endpoints; native notifications and voice-process
+controls remain desktop-only.
+
 ---
 
 ## 🖥️ Desktop App Overview
@@ -520,7 +545,7 @@ DELETE /api/reminders/:id
 GET    /api/reminders/pending-voice     →  { fired }
 ```
 
-Note: Active reminder scheduling is now owned by Electron (ReminderManager). The backend API stores reminder history.
+Note: Active desktop reminder scheduling is owned by backend Core and stored in its JSON state. `/api/reminders` remains a separate MongoDB history/scheduling system; these reminder records are not merged.
 
 </details>
 
@@ -621,8 +646,8 @@ backend/services/aiService.js
 - [x] Electron desktop app — animated orb UI, system tray, startup splash
 - [x] Pause / Resume mic from UI
 - [x] Clean shutdown vs hide-to-tray
-- [x] Electron-native timer system — persistent, live countdown UI
-- [x] Electron-native reminder system — persistent, missed-window recovery
+- [x] Core-owned timer system — persistent, live countdown UI
+- [x] Core-owned desktop reminder system — persistent, missed-window recovery
 - [x] Session sleep / wake lifecycle
 - [x] Persistent last-turn transcript display
 - [x] Query classifier (personal / general / opinion / action / mixed)

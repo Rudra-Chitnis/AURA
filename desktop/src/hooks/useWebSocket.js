@@ -22,6 +22,9 @@ export default function useWebSocket() {
     addToast,
     reminders,
     setReminders,
+    setRuntimeTimers,
+    setRuntimeReminders,
+    setStartupPhase,
     addDebugEvent,
   } = useStore();
 
@@ -30,6 +33,45 @@ export default function useWebSocket() {
       const msg = JSON.parse(event.data);
 
       switch (msg.type) {
+        case "runtime-state": {
+          if (!window.aura) setStartupPhase(msg.state || "ready");
+          break;
+        }
+
+        case "timer-tick": {
+          if (window.aura?.forwardCoreRuntimeEvent) window.aura.forwardCoreRuntimeEvent(msg);
+          else setRuntimeTimers(msg.timers || []);
+          break;
+        }
+
+        case "timer-fired": {
+          if (window.aura?.forwardCoreRuntimeEvent) window.aura.forwardCoreRuntimeEvent(msg);
+          else {
+            setRuntimeTimers(current => current.filter(timer => timer.id !== msg.id));
+            if ("Notification" in window && Notification.permission === "granted") {
+              new Notification("AURA Timer", { body: msg.text });
+            }
+          }
+          break;
+        }
+
+        case "reminder-updated": {
+          if (window.aura?.forwardCoreRuntimeEvent) window.aura.forwardCoreRuntimeEvent(msg);
+          else setRuntimeReminders(msg.reminders || []);
+          break;
+        }
+
+        case "reminder-fired": {
+          if (window.aura?.forwardCoreRuntimeEvent) window.aura.forwardCoreRuntimeEvent(msg);
+          else {
+            setRuntimeReminders(current => current.filter(reminder => reminder.id !== msg.id));
+            if ("Notification" in window && Notification.permission === "granted") {
+              new Notification("AURA Reminder", { body: msg.body });
+            }
+          }
+          break;
+        }
+
         case "voice": {
           setVoiceState(msg.state || "idle");
           if (msg.text) setVoiceTranscript(msg.text);
@@ -116,7 +158,7 @@ export default function useWebSocket() {
     } catch (e) {
       console.warn("[WS] parse error:", e);
     }
-  }, [setVoiceState, setVoiceTranscript, setCurrentResponse, addMessage, startStreaming, addAction, addToast, setReminders, addDebugEvent]);
+  }, [setVoiceState, setVoiceTranscript, setCurrentResponse, addMessage, startStreaming, addAction, addToast, setReminders, setRuntimeTimers, setRuntimeReminders, setStartupPhase, addDebugEvent]);
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;

@@ -2703,11 +2703,10 @@ def _launch_ps1_detached(path: str) -> bool:
 
 def set_native_timer(seconds: int) -> str:
     """
-    Delegate timer ownership to Electron desktop runtime.
+    Ask the headless Core to create and own the timer.
 
-    Emits AURA:SET_TIMER:<seconds>:<label> on stdout.  Electron's TimerManager
-    handles persistence, countdown, OS notification, and voice delivery — completely
-    independent of voice.py's lifecycle.
+    The historical AURA:SET_TIMER stdout marker remains a fallback for older
+    Core hosts that do not expose the runtime action endpoint.
 
     No Python thread, no in-process countdown, no PowerShell dependency.
     """
@@ -2720,8 +2719,18 @@ def set_native_timer(seconds: int) -> str:
     else:
         label = f"{seconds} second{'s' if seconds != 1 else ''}"
 
-    # Signal Electron — TimerManager owns scheduling, notification, and recovery
-    print(f"AURA:SET_TIMER:{seconds}:{label}", flush=True)
+    try:
+        response = requests.post(
+            f"{BACKEND}/api/runtime/actions",
+            json={"type": "timer.create", "label": label, "seconds": seconds},
+            timeout=4,
+        )
+        response.raise_for_status()
+        if not response.json().get("handled"):
+            raise RuntimeError("Core did not handle timer.create")
+    except Exception as e:
+        print(f"[Timer] Core request failed; emitting compatibility marker: {e}")
+        print(f"AURA:SET_TIMER:{seconds}:{label}", flush=True)
 
     return f"Timer set for {label}."
 
@@ -3339,12 +3348,19 @@ def send_set_reminder(reminder_text, reminder_time):
         resp.raise_for_status()
         time_str = reminder_time.strftime("%I:%M %p").lstrip("0")
 
-        # Delegate delivery to Electron ReminderManager — owns persistence, notification,
-        # and recovery independent of voice.py lifecycle.  MongoDB path preserved for history.
+        # Keep MongoDB reminder history and the Core desktop scheduler distinct.
         try:
+            core_response = requests.post(
+                f"{BACKEND}/api/runtime/actions",
+                json={"type": "reminder.create", "text": reminder_text, "fireAt": reminder_time.isoformat()},
+                timeout=4,
+            )
+            core_response.raise_for_status()
+            if not core_response.json().get("handled"):
+                raise RuntimeError("Core did not handle reminder.create")
+        except Exception as action_err:
+            print(f"[Reminder] Core request failed; emitting compatibility marker: {action_err}")
             print(f"AURA:SET_REMINDER:{reminder_text}:{reminder_time.isoformat()}", flush=True)
-        except Exception as sig_err:
-            print(f"[Reminder] Electron signal failed (non-fatal): {sig_err}")
 
         return f"Reminder set for {time_str}."
     except Exception as e:

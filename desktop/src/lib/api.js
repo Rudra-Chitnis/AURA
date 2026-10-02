@@ -1,9 +1,15 @@
 // ── API client — connects to existing Express backend ──────────────────────
 
-let _token  = null;
+let _token  = typeof window !== "undefined" ? window.localStorage?.getItem("aura_token") : null;
 let _baseUrl = "http://localhost:5000";
 
-export const setToken   = (t) => { _token   = t; };
+export const setToken   = (t) => {
+  _token = t;
+  if (typeof window !== "undefined") {
+    if (t) window.localStorage?.setItem("aura_token", t);
+    else window.localStorage?.removeItem("aura_token");
+  }
+};
 export const setBaseUrl = (u) => { _baseUrl = u; };
 export const getToken   = ()  => _token;
 
@@ -137,3 +143,12 @@ export const healthCheck = async () => {
     return false;
   }
 };
+
+// Local desktop-runtime capabilities are hosted by backend Core.
+export const getRuntimeState = () => apiFetch("/api/runtime/state");
+
+export const dispatchRuntimeAction = (action) =>
+  apiFetch("/api/runtime/actions", {
+    method: "POST",
+    body: JSON.stringify(action),
+  });

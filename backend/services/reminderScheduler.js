@@ -15,6 +15,7 @@ const Reminder                                         = require("../models/remi
 // In-memory queue of recently fired reminders the voice client can pull.
 // Entries: { reminderId: ObjectId, userId: string, text: string, firedAt: Date }
 const firedQueue = [];
+let schedulerHandle = null;
 
 // ─────────────────────────────────────────────
 // STARTUP RECOVERY
@@ -57,12 +58,13 @@ const _recoverUndelivered = async () => {
 // SCHEDULER ENTRY POINT
 // ─────────────────────────────────────────────
 const startReminderScheduler = async () => {
+  if (schedulerHandle) return stopReminderScheduler;
   console.log("[Scheduler] Reminder scheduler started — checking every 60s");
 
   // Run recovery once at startup before the first interval tick
   await _recoverUndelivered();
 
-  setInterval(async () => {
+  schedulerHandle = setInterval(async () => {
     try {
       const due = await getDueReminders();
 
@@ -90,6 +92,12 @@ const startReminderScheduler = async () => {
       console.error("[Scheduler] Tick error:", err.message);
     }
   }, 60 * 1000);
+  return stopReminderScheduler;
+};
+
+const stopReminderScheduler = () => {
+  if (schedulerHandle) clearInterval(schedulerHandle);
+  schedulerHandle = null;
 };
 
 
@@ -121,4 +129,4 @@ const popFiredForUser = (userId) => {
 };
 
 
-module.exports = { startReminderScheduler, popFiredForUser };
+module.exports = { startReminderScheduler, stopReminderScheduler, popFiredForUser };

@@ -113,6 +113,7 @@ contextBridge.exposeInMainWorld("aura", {
     ipcRenderer.on("reminder-updated", handler);
     return () => ipcRenderer.removeListener("reminder-updated", handler);
   },
+  forwardCoreRuntimeEvent: (event) => ipcRenderer.send("core-runtime-event", event),
 
   // ── wake voice from sleep ─────────────────────────────────────────────────
   voiceWake: () => ipcRenderer.invoke("voice-wake"),

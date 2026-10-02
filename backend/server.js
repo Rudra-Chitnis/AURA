@@ -13,10 +13,13 @@ const reminderRoute     = require("./routes/reminderRoute");
 const conversationRoute = require("./routes/conversationRoute");
 const diagnosticsRoute  = require("./routes/diagnosticsRoute");
 const eventRoute        = require("./routes/eventRoute");
+const { createRuntimeRouter } = require("./routes/runtimeRoute");
 
 const errorHandler = require("./middleware/errorHandler");
-const { startReminderScheduler, popFiredForUser } = require("./services/reminderScheduler");
+const { startReminderScheduler, stopReminderScheduler, popFiredForUser } = require("./services/reminderScheduler");
 const protect = require("./middleware/authMiddleware");
+const auraRuntime = require("./auraRuntime");
+const { bindCoreEvents } = require("./adapters/coreEventAdapter");
 
 const app = express();
 
@@ -43,6 +46,7 @@ app.use("/api/reminders",    reminderRoute);
 app.use("/api/conversation", conversationRoute);
 app.use("/api/diagnostics",  diagnosticsRoute);
 app.use("/api/events",       eventRoute);
+app.use("/api/runtime",      createRuntimeRouter(auraRuntime));
 
 // Voice client polls this every ~30s to check if any reminders fired
 app.get("/api/reminders/pending-voice", protect, (req, res) => {
@@ -72,8 +76,34 @@ app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
+const unbindCoreEvents = bindCoreEvents(auraRuntime, event => wsHub.broadcast(event));
+auraRuntime.start();
+const server = app.listen(PORT, () => {
   console.log(`AURA backend running on port ${PORT}`);
   startReminderScheduler();
   wsHub.start(5001);   // start WebSocket hub for real-time UI updates
 });
+
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  unbindCoreEvents();
+  auraRuntime.stop();
+  stopReminderScheduler();
+  if (server.listening) await new Promise(resolve => server.close(resolve));
+  await wsHub.stop();
+  const mongoose = require("mongoose");
+  if (mongoose.connection.readyState !== 0) await mongoose.disconnect();
+}
+
+if (require.main === module) {
+  const stop = () => shutdown().then(() => process.exit(0)).catch(error => {
+    console.error("[AURA] Shutdown failed:", error);
+    process.exit(1);
+  });
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+}
+
+module.exports = { app, server, shutdown };

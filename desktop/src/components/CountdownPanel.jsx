@@ -1,4 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
+import useStore from "../store/useStore";
+import { dispatchRuntimeAction, getRuntimeState } from "../lib/api";
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -183,10 +185,22 @@ const ReminderChip = ({ reminder, onCancel }) => {
 const CountdownPanel = () => {
   const [timers,    setTimers]    = useState([]);
   const [reminders, setReminders] = useState([]);
+  const browserTimers = useStore((s) => s.runtimeTimers);
+  const browserReminders = useStore((s) => s.runtimeReminders);
+  const setBrowserTimers = useStore((s) => s.setRuntimeTimers);
+  const setBrowserReminders = useStore((s) => s.setRuntimeReminders);
+  const isBrowserClient = !window.aura;
 
-  // Subscribe to IPC events from Electron TimerManager + ReminderManager
+  // Electron keeps its established IPC subscriptions; browser mode consumes
+  // backend Core state/events through HTTP and the existing WebSocket.
   useEffect(() => {
-    if (!window.aura) return;
+    if (!window.aura) {
+      getRuntimeState().then((state) => {
+        setBrowserTimers(state.timers || []);
+        setBrowserReminders(state.reminders || []);
+      }).catch(() => {});
+      return;
+    }
 
     // Seed on mount
     window.aura.listTimers?.().then(setTimers).catch(() => {});
@@ -205,23 +219,35 @@ const CountdownPanel = () => {
       cleanupReminder?.();
       cleanupFired?.();
     };
-  }, []);
+  }, [setBrowserTimers, setBrowserReminders]);
 
   const cancelTimer = useCallback(async (id) => {
     try {
-      await window.aura?.cancelTimer(id);
-      setTimers((prev) => prev.filter((t) => t.id !== id));
+      if (window.aura) {
+        await window.aura.cancelTimer(id);
+        setTimers((prev) => prev.filter((t) => t.id !== id));
+      } else {
+        await dispatchRuntimeAction({ type: "timer.cancel", id });
+        setBrowserTimers((prev) => prev.filter((t) => t.id !== id));
+      }
     } catch {}
   }, []);
 
   const cancelReminder = useCallback(async (id) => {
     try {
-      await window.aura?.cancelDesktopReminder(id);
-      setReminders((prev) => prev.filter((r) => r.id !== id));
+      if (window.aura) {
+        await window.aura.cancelDesktopReminder(id);
+        setReminders((prev) => prev.filter((r) => r.id !== id));
+      } else {
+        await dispatchRuntimeAction({ type: "reminder.cancel", id });
+        setBrowserReminders((prev) => prev.filter((r) => r.id !== id));
+      }
     } catch {}
   }, []);
 
-  const hasItems = timers.length > 0 || reminders.length > 0;
+  const visibleTimers = isBrowserClient ? browserTimers : timers;
+  const visibleReminders = isBrowserClient ? browserReminders : reminders;
+  const hasItems = visibleTimers.length > 0 || visibleReminders.length > 0;
   if (!hasItems) return null;
 
   return (
@@ -240,10 +266,10 @@ const CountdownPanel = () => {
         animation:      "fade-in 0.2s ease-out",
       }}
     >
-      {timers.map((t) => (
+      {visibleTimers.map((t) => (
         <TimerChip key={t.id} timer={t} onCancel={cancelTimer} />
       ))}
-      {reminders.map((r) => (
+      {visibleReminders.map((r) => (
         <ReminderChip key={r.id} reminder={r} onCancel={cancelReminder} />
       ))}
     </div>

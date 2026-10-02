@@ -170,8 +170,8 @@ export default function App() {
     (async () => {
       try {
         const [savedToken, savedSettings] = await Promise.all([
-          window.aura?.getToken(),
-          window.aura?.loadSettings(),
+          window.aura?.getToken() ?? window.localStorage.getItem("aura_token"),
+          window.aura?.loadSettings() ?? JSON.parse(window.localStorage.getItem("aura_settings") || "null"),
         ]);
         if (savedToken) {
           setToken(savedToken);

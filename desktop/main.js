@@ -9,7 +9,6 @@ const { spawn, execFile,spawnSync } = require("child_process");
 
 const { AuraRuntime } = require("./core/auraRuntime");
 const {
-  bindRuntimeEvents,
   createRuntimeIpcAdapter,
   registerRuntimeIpcHandlers,
 } = require("./adapters/runtimeIpcAdapter");
@@ -47,6 +46,7 @@ let tray         = null;
 let backendProc  = null;
 let voiceProc    = null;
 let voicePaused  = false;
+let backendApiReady = null;
 app.isQuitting   = false;
 
 // The headless runtime is composed after Electron exposes its user data path.
@@ -78,8 +78,48 @@ function emitPhase(phase) {
 }
 
 const runtimeIpcAdapter = createRuntimeIpcAdapter({
-  getRuntime: () => auraRuntime,
+  request: async (endpoint, options = {}) => {
+    if (!backendApiReady) {
+      backendApiReady = auraRuntime.backendReadiness.waitForBackend(BACKEND_PORT).catch(error => {
+        backendApiReady = null;
+        throw error;
+      });
+    }
+    await backendApiReady;
+    const requestOptions = {
+      method: options.method || "GET",
+      headers: { "Content-Type": "application/json" },
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    };
+    let response;
+    try {
+      response = await fetch(`http://127.0.0.1:${BACKEND_PORT}${endpoint}`, requestOptions);
+    } catch (error) {
+      backendApiReady = null;
+      if (app.isQuitting) throw error;
+      backendApiReady = auraRuntime.backendReadiness.waitForBackend(BACKEND_PORT).catch(readinessError => {
+        backendApiReady = null;
+        throw readinessError;
+      });
+      await backendApiReady;
+      response = await fetch(`http://127.0.0.1:${BACKEND_PORT}${endpoint}`, requestOptions);
+    }
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.message || `Core request failed (${response.status})`);
+    return payload;
+  },
   send: safeSend,
+  notifyTimer: body => {
+    try {
+      if (Notification.isSupported()) new Notification({ title: "AURA Timer", body, silent: false }).show();
+    } catch (e) { console.warn("[TimerManager] Notification failed:", e.message); }
+  },
+  notifyReminder: body => {
+    try {
+      if (Notification.isSupported()) new Notification({ title: "AURA Reminder", body, silent: false }).show();
+    } catch (e) { console.warn("[ReminderManager] Notification failed:", e.message); }
+  },
+  speak: _speakViaVoice,
 });
 
 // ─── file logging ─────────────────────────────────────────────────────────────
@@ -423,7 +463,7 @@ function startBackend() {
 function spawnBackendProcess(serverFile) {
   backendProc = spawn("node", [serverFile], {
     cwd:         path.dirname(serverFile),
-    env:         { ...process.env, PORT: String(BACKEND_PORT) },
+    env:         { ...process.env, PORT: String(BACKEND_PORT), AURA_DATA_DIR: app.getPath("userData") },
     stdio:       ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -501,24 +541,25 @@ function startVoice() {
         } catch {}
       }
 
-      // ── Timer signal — voice.py prints AURA:SET_TIMER:seconds:label ───────
-      // Electron owns the timer from this point: countdown, notification, UI tick.
+      // ── Legacy timer signal — current voice.py calls Core HTTP directly. ──
       const timerMatch = msg.match(/^AURA:SET_TIMER:(\d+):(.+)$/);
       if (timerMatch) {
         const secs  = parseInt(timerMatch[1], 10);
         const label = timerMatch[2].trim();
-        runtimeIpcAdapter.dispatchAction({ type: "timer.create", label, seconds: secs });
-        runtimeIpcAdapter.sendTimerList();
+        runtimeIpcAdapter.dispatchAction({ type: "timer.create", label, seconds: secs })
+          .then(() => runtimeIpcAdapter.sendTimerList())
+          .catch(error => console.warn("[AURA] Legacy timer request failed:", error.message));
         console.log(`[AURA] Timer registered via voice: "${label}" ${secs}s`);
       }
 
       // ── Reminder signal — voice.py prints AURA:SET_REMINDER:text:isoTime ──
-      // Electron schedules delivery. MongoDB path (for history) is handled separately.
+      // Legacy marker; the authenticated MongoDB reminder history is separate.
       const reminderMatch = msg.match(/^AURA:SET_REMINDER:(.+):(\d{4}-\d{2}-\d{2}T[\d:.Z+-]+)$/);
       if (reminderMatch) {
         const text   = reminderMatch[1].trim();
         const fireAt = reminderMatch[2].trim();
-        runtimeIpcAdapter.dispatchAction({ type: "reminder.create", text, fireAt });
+        runtimeIpcAdapter.dispatchAction({ type: "reminder.create", text, fireAt })
+          .catch(error => console.warn("[AURA] Legacy reminder request failed:", error.message));
         console.log(`[AURA] Reminder registered via voice: "${text}" at ${fireAt}`);
       }
 
@@ -792,10 +833,8 @@ app.whenReady().then(() => {
   setupFileLogging();
   nativeTheme.themeSource = "dark";
 
-  // The runtime owns scheduling and persistence; this shell adapter preserves
-  // the existing IPC, OS notification, and voice delivery behavior.
+  // Electron hosts process startup; application timers/reminders run in backend Core.
   auraRuntime = new AuraRuntime({
-    dataDirectory: app.getPath("userData"),
     ollama: {
       port: OLLAMA_PORT,
       primaryModel: OLLAMA_PRIMARY_MODEL,
@@ -827,20 +866,7 @@ app.whenReady().then(() => {
       killBackend: () => { if (backendProc) try { backendProc.kill(); } catch {} },
     },
   });
-  bindRuntimeEvents(auraRuntime, {
-    send: safeSend,
-    notifyTimer: body => {
-      try {
-        if (Notification.isSupported()) new Notification({ title: "AURA Timer", body, silent: false }).show();
-      } catch (e) { console.warn("[TimerManager] Notification failed:", e.message); }
-    },
-    notifyReminder: body => {
-      try {
-        if (Notification.isSupported()) new Notification({ title: "AURA Reminder", body, silent: false }).show();
-      } catch (e) { console.warn("[ReminderManager] Notification failed:", e.message); }
-    },
-    speak: _speakViaVoice,
-  });
+  auraRuntime.on("runtime:state", state => safeSend("runtime-state", state));
   emitPhase("launching");
   auraRuntime.start();
 

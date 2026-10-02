@@ -2,8 +2,7 @@ const express = require("express");
 const router = express.Router();
 
 const protect = require("../middleware/authMiddleware");
-const { storeMemory, getMemories, searchMemory } = require("../services/memoryService");
-const { getConsolidationSummary } = require("../services/memoryConsolidationService");
+const auraRuntime = require("../auraRuntime");
 
 
 // STORE A MEMORY
@@ -15,7 +14,7 @@ router.post("/store", protect, async (req, res, next) => {
       return res.status(400).json({ message: "content is required" });
     }
 
-    const memory = await storeMemory(req.user._id, content, type);
+    const memory = await auraRuntime.memory.store(req.user._id, content, type);
 
     res.status(201).json({
       message: "Memory stored",
@@ -30,7 +29,7 @@ router.post("/store", protect, async (req, res, next) => {
 // LIST ALL MEMORIES FOR USER
 router.get("/list", protect, async (req, res, next) => {
   try {
-    const memories = await getMemories(req.user._id);
+    const memories = await auraRuntime.memory.list(req.user._id);
     res.json({ memories });
   } catch (err) {
     next(err);
@@ -41,7 +40,7 @@ router.get("/list", protect, async (req, res, next) => {
 // LIST CONSOLIDATED SEMANTIC PATTERNS
 router.get("/patterns", protect, async (req, res, next) => {
   try {
-    const patterns = await getConsolidationSummary(req.user._id);
+    const patterns = await auraRuntime.semanticLearning.getSummary(req.user._id);
     res.json({ patterns });
   } catch (err) {
     next(err);
@@ -58,7 +57,7 @@ router.post("/search", protect, async (req, res, next) => {
       return res.status(400).json({ message: "query is required" });
     }
 
-    const results = await searchMemory(req.user._id, query);
+    const results = await auraRuntime.memory.search(req.user._id, query);
     res.json({ results });
   } catch (err) {
     next(err);

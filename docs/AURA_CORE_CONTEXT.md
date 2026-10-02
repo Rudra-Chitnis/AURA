@@ -51,7 +51,10 @@ The current implementation is Windows-oriented and uses:
 - Ollama
 - local embeddings through `@xenova/transformers`
 
-The current stable implementation is tightly orchestrated by Electron.
+The stable `aura-v2` implementation is tightly orchestrated by Electron. On
+`aura-core`, `backend/server.js` is the independently runnable Core host; the
+Electron desktop remains an adapter that can spawn that backend for the
+existing desktop launch experience.
 
 The purpose of `aura-core` is NOT to create a completely different assistant.
 
@@ -115,8 +118,9 @@ Conceptually:
           |
        LLM output
 
-The React UI is hosted inside Electron and communicates with the Electron main
-process through IPC and with the Node backend through HTTP/WebSocket.
+The React UI can run in Electron or in a browser. It communicates with backend
+Core using HTTP/SSE and WebSocket; Electron-specific window, settings, process,
+notification, and voice controls continue through IPC.
 
 ---
 
@@ -144,7 +148,7 @@ Responsibilities include:
 - tray integration
 - native window behavior
 - IPC
-- Core timer/reminder adapter calls and event forwarding
+- forwarding backend Core events to existing IPC channels
 - notifications
 - voice process lifecycle
 - backend process lifecycle
@@ -152,9 +156,12 @@ Responsibilities include:
 - application settings/token persistence
 - communication with the React renderer
 
-Electron is therefore NOT currently just a UI shell. It composes the desktop
-Core, creates OS processes, and adapts runtime events to IPC and native OS
-behavior. Some sequencing/retry decisions now live in Core callbacks.
+Electron remains the desktop host and still creates OS processes and manages
+desktop lifecycle. It no longer owns timer/reminder scheduling or their
+persistence; timer/reminder operations go to backend Core over local HTTP and
+runtime events arrive over the existing WebSocket connection before IPC
+forwarding. Voice lifecycle controls and native notification delivery remain
+Electron-specific.
 
 This is one of the most important architectural facts.
 
@@ -610,27 +617,27 @@ It also communicates with Electron through stdin/stdout conventions.
 
 ---
 
-# 18. Voice → Electron Coupling
+# 18. Voice → Core and Host Coupling
 
-The current voice runtime emits process signals such as:
+The current voice runtime sends timer/reminder operations directly to
+`POST /api/runtime/actions`. The historical stdout markers remain supported by
+Electron as a compatibility fallback:
 
 AURA:SET_TIMER:...
 
 AURA:SET_REMINDER:...
 
-Electron still parses these stdout signals and adapts timer/reminder creation
-to the headless runtime in `desktop/core`. Timer/reminder scheduling and JSON
-persistence now live in `TimerManager` and `ReminderManager`; Electron retains
-the stdout adapter, IPC/UI synchronization, native notifications, and voice
-delivery.
+Electron still interprets voice process-control signals and compatibility timer
+or reminder markers. Backend Core owns logical scheduling, JSON persistence,
+recovery, and fired events. Electron adapts fired events to legacy IPC,
+notifications, and voice speech.
 
 Therefore the current voice process is not autonomous.
 
 There is a direct protocol coupling:
 
-Python voice --stdout--> Electron adapter --> desktop/core/AuraRuntime
-                                      ├--> TimerManager
-                                      └--> ReminderManager
+Python voice --HTTP--> backend Core timer/reminder operations
+Python voice --stdout--> Electron process-control / legacy marker adapter
 
 This is one of the most important boundaries to eliminate or redesign.
 
@@ -638,15 +645,15 @@ This is one of the most important boundaries to eliminate or redesign.
 
 # 19. Timer / Reminder Ownership
 
-Desktop timer and reminder scheduling are currently in the headless runtime
-modules composed by Electron.
+Timer and desktop-reminder scheduling now run in backend Core, which can start
+without Electron.
 
 Files:
 
-desktop/core/timerManager.js
-desktop/core/reminderManager.js
+backend/core/timerManager.js
+backend/core/desktopReminderManager.js
 
-The desktop Core currently owns:
+Backend Core owns:
 
 - timer persistence
 - timer scheduling
@@ -657,12 +664,9 @@ Electron still adapts Core events to renderer IPC, native notification delivery,
 and voice speech. Backend MongoDB reminders are a separate existing system and
 are not the same records as desktop reminders.
 
-This leaves a host dependency:
-
-The runtime is still hosted/started by Electron, but timer and reminder logic
-no longer imports Electron APIs.
-
-Future AURA Core should own the logical timer/reminder service.
+The backend Core is now a runnable host for this capability. The backend
+server starts and stops the timer/reminder runtime without Electron; the desktop
+adapter continues to supervise that backend process in desktop mode.
 
 A client should only display timer/reminder state and notifications.
 
@@ -781,13 +785,13 @@ and tested.
 
 The biggest problem is NOT simply "Electron is heavy."
 
-The deeper problem is that Electron still acts as:
+The remaining desktop coupling is that Electron still acts as:
 
 - UI host
 - process supervisor
 - startup manager
 - runtime coordinator
-- desktop runtime host for timers and reminders
+- desktop host that launches/supervises backend and voice processes
 - notification owner
 - authentication storage layer
 - IPC broker
@@ -1241,16 +1245,24 @@ The desired refactor is therefore:
 
 CURRENT:
 
-Electron host
-    ├── UI / BrowserWindow / IPC / OS integration
-    ├── process spawning and OS handles
-    └── composes desktop Core
-             ├── timer/reminder state and scheduling
-             ├── deterministic timer/reminder actions
-             └── startup/restart coordination callbacks
+Backend Core host (`npm --prefix backend start`)
+    ├── conversation / AI capability / memory / semantic learning
+    ├── timer and desktop-reminder JSON runtime
+    ├── diagnostics and runtime event routing
+    ├── HTTP/SSE API and WebSocket transport adapters
+    └── MongoDB-backed existing services
 
-Backend host
-    └── composes backend Core for conversation and diagnostic/event routing
+Electron desktop adapter
+    ├── BrowserWindow / tray / IPC / notifications
+    ├── backend and voice process handles / restart supervision
+    └── HTTP/WebSocket adapters to backend Core
+
+Browser client
+    └── existing React renderer over HTTP/SSE and WebSocket
+
+Python voice client/worker
+    ├── HTTP to backend Core for turns, memory, reminders, and timer actions
+    └── stdin/stdout for voice process control and compatibility markers
 
 TARGET:
 
@@ -1278,5 +1290,7 @@ Providers
     ├── TTS
     └── Embeddings
 
+The backend server is the current headless application entrypoint; the backend
+Core remains hosted by that server and is not yet a separate package/process.
 The objective is separation of responsibility, independent failure domains,
-observability, testability, and future client/provider flexibility.
+observability, testability, and client/provider flexibility.

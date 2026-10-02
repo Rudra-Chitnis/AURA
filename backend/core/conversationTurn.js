@@ -8,7 +8,7 @@ const {
   classifyQuery,
   isSummaryRequest,
   detectIdentityEntities,
-} = require("../services/aiService");
+} = require("./aiCapability");
 const { searchMemory } = require("../services/memoryService");
 const {
   withUserTurnLock,

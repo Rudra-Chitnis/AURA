@@ -34,6 +34,11 @@ const useStore = create((set, get) => ({
   startupPhase: "launching",
   setStartupPhase: (phase) => set({ startupPhase: phase }),
 
+  runtimeTimers: [],
+  runtimeReminders: [],
+  setRuntimeTimers: (runtimeTimers) => set((s) => ({ runtimeTimers: typeof runtimeTimers === "function" ? runtimeTimers(s.runtimeTimers) : runtimeTimers })),
+  setRuntimeReminders: (runtimeReminders) => set((s) => ({ runtimeReminders: typeof runtimeReminders === "function" ? runtimeReminders(s.runtimeReminders) : runtimeReminders })),
+
   // ── Voice ──────────────────────────────────────────────────────────────
   // idle | listening | thinking | speaking | executing
   voiceState:      "idle",
@@ -215,6 +220,7 @@ const useStore = create((set, get) => ({
       const next = { ...s.settings, ...patch };
       // Persist to ~/.aura_settings via Electron IPC (best-effort)
       window.aura?.saveSettings(next);
+      if (!window.aura) window.localStorage.setItem("aura_settings", JSON.stringify(next));
       return { settings: next };
     });
   },
