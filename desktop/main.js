@@ -6,7 +6,7 @@ const path  = require("path");
 const os    = require("os");
 const fs    = require("fs");
 const http  = require("http");
-const { spawn, execFile } = require("child_process");
+const { spawn, execFile,spawnSync } = require("child_process");
 
 const { AuraRuntime } = require("./core/auraRuntime");
 
@@ -475,29 +475,56 @@ function _pollUntilModelReady(attempts, maxAttempts) {
 // Try py (Windows launcher) → python → python3, return the first one that works.
 // Falls back to "python" if none can be verified (spawn will fail later with a clear error).
 function findPython() {
-  // On Windows, try py first (works with python.org installs).
-  // On other platforms, try python3 first.
+  // ─── AURA project virtual environment ─────────────────────────────────────
+  // Prefer the project's own .venv so voice.py always runs with the exact
+  // dependencies installed for AURA.
+  if (process.platform === "win32") {
+    const venvPython = path.join(__dirname, "..", ".venv", "Scripts", "python.exe");
+
+    try {
+      if (fs.existsSync(venvPython)) {
+        const result = spawnSync(venvPython, ["--version"], {
+          timeout: 3000,
+          windowsHide: true,
+        });
+
+        if (result.status === 0) {
+          console.log(`[AURA] Using AURA virtual environment: ${venvPython}`);
+          return venvPython;
+        }
+      }
+    } catch (err) {
+      console.warn("[AURA] Failed to validate .venv Python:", err.message);
+    }
+  }
+
+  // ─── Fallback to system Python ────────────────────────────────────────────
+  // Keep the existing fallback for machines where .venv doesn't exist.
   const candidates = process.platform === "win32"
     ? ["py", "python", "python3"]
     : ["python3", "python"];
 
   for (const exe of candidates) {
     try {
-      // Synchronous check — this is only called at startup, before voice is spawned.
-      const result = require("child_process").spawnSync(exe, ["--version"], {
-        timeout:     3000,
+      const result = spawnSync(exe, ["--version"], {
+        timeout: 3000,
         windowsHide: true,
       });
+
       if (result.status === 0) {
-        console.log(`[AURA] Python found: ${exe}`);
+        console.log(`[AURA] Python fallback found: ${exe}`);
         return exe;
       }
     } catch (_) {
       // try next
     }
   }
-  console.warn("[AURA] No Python found (tried py, python, python3) — voice will fail.");
-  return "python";  // spawn will produce a clear error message when it fails
+
+  console.warn(
+    "[AURA] No Python found (tried AURA .venv, py, python, python3) — voice will fail."
+  );
+
+  return "python";
 }
 
 const _pythonExe = findPython();  // resolved once at startup

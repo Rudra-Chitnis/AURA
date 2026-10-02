@@ -29,6 +29,7 @@ release/
 desktop/dist/
 desktop/release/
 desktop/build/
+benchmark/reports/
 
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
