@@ -11,6 +11,7 @@ import ToastStack    from "./components/ToastStack";
 import SplashScreen  from "./components/SplashScreen";
 import CountdownPanel from "./components/CountdownPanel";
 import DebugPanel    from "./components/DebugPanel";
+import BrowserApp from "./BrowserApp";
 
 // ── Auth card (shown when not logged in) ──────────────────────────────────
 const AuthCard = () => {
@@ -142,7 +143,7 @@ const OfflineBanner = ({ online }) => {
 };
 
 // ── Main App ──────────────────────────────────────────────────────────────
-export default function App() {
+function DesktopApp() {
   const {
     settings,
     token,
@@ -338,4 +339,8 @@ export default function App() {
       {debugEnabled && <DebugPanel />}
     </div>
   );
+}
+
+export default function App() {
+  return window.aura ? <DesktopApp /> : <BrowserApp />;
 }

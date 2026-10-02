@@ -1,7 +1,9 @@
 // ── API client — connects to existing Express backend ──────────────────────
 
 let _token  = typeof window !== "undefined" ? window.localStorage?.getItem("aura_token") : null;
-let _baseUrl = "http://localhost:5000";
+let _baseUrl = typeof window !== "undefined" && !window.aura
+  ? window.localStorage?.getItem("aura_browser_backend") || "http://localhost:5000"
+  : "http://localhost:5000";
 
 export const setToken   = (t) => {
   _token = t;
@@ -58,7 +60,9 @@ export const ask = (query) =>
   });
 
 // ── AI — streaming SSE ────────────────────────────────────────────────────
-export const askStream = async (query, _history = [], onToken, onDone) => {
+export const askStream = async (query, _history = [], onToken, onDone, { signal } = {}) => {
+  const startedAt = performance.now();
+  let firstTokenMs = null;
   const res = await fetch(`${_baseUrl}/api/ai/ask-stream`, {
     method:  "POST",
     headers: {
@@ -69,6 +73,7 @@ export const askStream = async (query, _history = [], onToken, onDone) => {
       query,
       time_context: new Date().toLocaleString(),
     }),
+    signal,
   });
 
   if (!res.ok) {
@@ -77,9 +82,11 @@ export const askStream = async (query, _history = [], onToken, onDone) => {
     throw new Error(msg);
   }
 
+  if (!res.body?.getReader) throw new Error("The Core response did not include a readable stream.");
   const reader  = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer    = "";
+  let tokenCount = 0;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -92,12 +99,26 @@ export const askStream = async (query, _history = [], onToken, onDone) => {
     for (const line of lines) {
       if (!line.startsWith("data: ")) continue;
       const data = line.slice(6).trim();
-      if (data === "[DONE]") { onDone?.(); return; }
-      try { onToken(JSON.parse(data)); } catch {}
+      if (data === "[DONE]") {
+        if (tokenCount === 0) throw new Error("AURA returned an empty response stream.");
+        const metrics = { durationMs: Math.round(performance.now() - startedAt), firstTokenMs };
+        onDone?.(metrics);
+        return metrics;
+      }
+      let token;
+      try { token = JSON.parse(data); } catch { continue; }
+      if (token && typeof token === "object" && token.__error) {
+        throw new Error(token.message || "AURA could not complete this response.");
+      }
+      if (firstTokenMs === null) firstTokenMs = Math.round(performance.now() - startedAt);
+      tokenCount += 1;
+      onToken?.(token);
     }
   }
 
-  onDone?.();
+  const metrics = { durationMs: Math.round(performance.now() - startedAt), firstTokenMs };
+  onDone?.(metrics);
+  return metrics;
 };
 
 // ── Memory ────────────────────────────────────────────────────────────────
@@ -146,6 +167,23 @@ export const healthCheck = async () => {
 
 // Local desktop-runtime capabilities are hosted by backend Core.
 export const getRuntimeState = () => apiFetch("/api/runtime/state");
+
+export const getConversationHistory = () => apiFetch("/api/conversation/history");
+
+export const getRecentDiagnostics = (limit = 100) =>
+  apiFetch(`/api/diagnostics/recent?limit=${encodeURIComponent(limit)}`);
+
+export const getHealthStatus = async () => {
+  try {
+    const response = await fetch(`${_baseUrl}/api/health`, { signal: AbortSignal.timeout(3000) });
+    const body = await response.json().catch(() => ({}));
+    return response.ok && body?.ok
+      ? { status: "online", body }
+      : { status: response.status === 503 ? "degraded" : "offline", body };
+  } catch (error) {
+    return { status: "offline", body: null, error };
+  }
+};
 
 export const dispatchRuntimeAction = (action) =>
   apiFetch("/api/runtime/actions", {
