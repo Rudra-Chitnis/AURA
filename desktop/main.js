@@ -56,7 +56,6 @@ let auraRuntime = null;
 // Phases (in order): launching → starting-backend → checking-ollama →
 //                    loading-voice → warming-models → ready
 // We buffer the current phase so it can be replayed when the window loads.
-let _currentPhase = "launching";
 let _windowReady  = false;   // true after did-finish-load fires
 
 // ─── safe IPC send ────────────────────────────────────────────────────────────
@@ -73,7 +72,7 @@ function safeSend(channel, ...args) {
 }
 
 function emitPhase(phase) {
-  _currentPhase = phase;
+  auraRuntime.setStartupPhase(phase);
   console.log(`[AURA] Startup phase: ${phase}`);
   if (_windowReady) safeSend("startup-phase", phase);
 }
@@ -205,7 +204,7 @@ function createWindow() {
   mainWindow.webContents.on("did-finish-load", () => {
     _windowReady = true;
     // Re-send current phase on every load (handles renderer reload after crash)
-    safeSend("startup-phase", _currentPhase);
+    safeSend("startup-phase", auraRuntime.getStartupPhase());
 
     // Attach backend stdout → log panel forwarding exactly once.
     // Guard: backendProc must exist AND still have readable stdout.
@@ -764,7 +763,7 @@ function startVoice() {
   // can take 2-3 min on slower machines or cold network connections.
   // VOICE_READY is the correct signal — this timeout is a last-resort UI unblock only.
   setTimeout(() => {
-    if (_currentPhase !== "ready") {
+    if (auraRuntime.getStartupPhase() !== "ready") {
       console.warn("[AURA] Voice startup timeout (180s) — unblocking UI. Voice may still be loading.");
       emitPhase("ready");
     }
@@ -1014,7 +1013,6 @@ ipcMain.on("show-notification", (_, { title, body }) => {
 app.whenReady().then(() => {
   setupFileLogging();
   nativeTheme.themeSource = "dark";
-  emitPhase("launching");
 
   // The runtime owns scheduling and persistence; this shell adapter preserves
   // the existing IPC, OS notification, and voice delivery behavior.
@@ -1037,6 +1035,7 @@ app.whenReady().then(() => {
     safeSend("reminder-fired", { id: reminder.id, text: reminder.text, body });
     _speakViaVoice(body);
   });
+  emitPhase("launching");
   auraRuntime.start();
 
   startBackend();

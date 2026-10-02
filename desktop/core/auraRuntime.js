@@ -3,14 +3,16 @@
 const { EventEmitter } = require("events");
 const { TimerManager } = require("./timerManager");
 const { ReminderManager } = require("./reminderManager");
+const { RuntimeLifecycle } = require("./runtimeLifecycle");
 
 // Headless runtime composition used by the desktop shell. This module has no
 // dependency on Electron; the host supplies its persistent data directory.
 class AuraRuntime extends EventEmitter {
-  constructor({ dataDirectory }) {
+  constructor({ dataDirectory, lifecycle = new RuntimeLifecycle() }) {
     super();
     if (!dataDirectory) throw new Error("AuraRuntime requires a dataDirectory");
     this.dataDirectory = dataDirectory;
+    this.lifecycle = lifecycle;
     this.state = "stopped";
     this.timers = new TimerManager({ dataDirectory, events: this });
     this.reminders = new ReminderManager({ dataDirectory, events: this });
@@ -40,6 +42,14 @@ class AuraRuntime extends EventEmitter {
       timers: this.timers.listTimers(),
       reminders: this.reminders.listReminders(),
     };
+  }
+
+  setStartupPhase(phase) {
+    return this.lifecycle.setPhase(phase);
+  }
+
+  getStartupPhase() {
+    return this.lifecycle.getPhase();
   }
 }
 
