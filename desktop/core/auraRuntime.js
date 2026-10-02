@@ -7,11 +7,12 @@ const { RuntimeLifecycle } = require("./runtimeLifecycle");
 const { DeterministicActionRouter } = require("./deterministicActionRouter");
 const { waitForBackend } = require("./backendReadiness");
 const { createOllamaReadiness } = require("./ollamaReadiness");
+const { RuntimeProcessCoordinator } = require("./runtimeProcessCoordinator");
 
 // Headless runtime composition used by the desktop shell. This module has no
 // dependency on Electron; the host supplies its persistent data directory.
 class AuraRuntime extends EventEmitter {
-  constructor({ dataDirectory, lifecycle = new RuntimeLifecycle(), ollama = {} }) {
+  constructor({ dataDirectory, lifecycle = new RuntimeLifecycle(), ollama = {}, processes = null }) {
     super();
     if (!dataDirectory) throw new Error("AuraRuntime requires a dataDirectory");
     this.dataDirectory = dataDirectory;
@@ -25,6 +26,7 @@ class AuraRuntime extends EventEmitter {
     });
     this.backendReadiness = Object.freeze({ waitForBackend });
     this.ollamaReadiness = createOllamaReadiness(ollama);
+    this.processes = processes ? new RuntimeProcessCoordinator(processes) : null;
   }
 
   start() {

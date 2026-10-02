@@ -44,10 +44,6 @@ let voiceProc    = null;
 let voicePaused  = false;
 app.isQuitting   = false;
 
-// Retry counters for exponential backoff
-let _backendRestartCount = 0;
-let _voiceRestartCount   = 0;
-
 // The headless runtime is composed after Electron exposes its user data path.
 let auraRuntime = null;
 
@@ -411,12 +407,10 @@ function startBackend() {
     return;
   }
 
-  emitPhase("starting-backend");
-  _backendRestartCount = 0;
-  _spawnBackend(serverFile);
+  auraRuntime.processes.startBackend(serverFile);
 }
 
-function _spawnBackend(serverFile) {
+function spawnBackendProcess(serverFile) {
   backendProc = spawn("node", [serverFile], {
     cwd:         path.dirname(serverFile),
     env:         { ...process.env, PORT: String(BACKEND_PORT) },
@@ -437,65 +431,10 @@ function _spawnBackend(serverFile) {
     console.log("[backend] exited:", code);
     backendProc = null;
     safeSend("backend-status", "offline");
-
-    // Attempt restart with exponential backoff — max 3 restarts.
-    // Don't restart if we're shutting down.
-    if (!app.isQuitting && _backendRestartCount < 3) {
-      const delay = Math.min(5000 * Math.pow(2, _backendRestartCount), 30000);
-      _backendRestartCount++;
-      console.log(`[AURA] Backend restart ${_backendRestartCount}/3 in ${delay / 1000}s...`);
-      setTimeout(() => {
-        if (!backendProc && !app.isQuitting) {
-          _spawnBackend(serverFile);
-          // Re-poll health to update voice and UI
-          auraRuntime.backendReadiness.waitForBackend(BACKEND_PORT, 20000)
-            .then(() => {
-              console.log("[AURA] Backend recovered — health check passed.");
-              safeSend("backend-status", "online");
-            })
-            .catch(() => {
-              console.warn("[AURA] Backend recovery health check failed.");
-            });
-        }
-      }, delay);
-    } else if (!app.isQuitting) {
-      console.error("[AURA] Backend failed to recover after 3 restarts. Manual intervention required.");
-      safeSend("backend-status", "failed");
-    }
+    auraRuntime.processes.backendExited(code);
   });
 
   console.log("[AURA] Backend spawned, PID", backendProc.pid);
-
-  // Wait for backend to be truly accepting HTTP connections (health endpoint = 200 + Mongo ready),
-  // THEN check Ollama, THEN start voice. This is the correct sequential startup order.
-  auraRuntime.backendReadiness.waitForBackend(BACKEND_PORT, 40000)
-    .then(async () => {
-      console.log("[AURA] Backend health check passed.");
-      _backendRestartCount = 0;  // reset counter on successful start
-      safeSend("backend-status", "online");
-
-      // Ollama check before voice — voice.py will immediately query on its first LLM call
-      await ensureOllama();
-
-      // NOW emit loading-voice and spawn voice.py
-      emitPhase("loading-voice");
-      if (!voiceProc && !app.isQuitting) {
-        voiceProc = startVoice();
-        safeSend("voice-status", voiceProc ? "running" : "error");
-      }
-    })
-    .catch((err) => {
-      console.warn("[AURA] Backend health check failed:", err.message);
-      // Backend is unreachable after 40s. Still attempt Ollama check and voice
-      // so user can see the error rather than a frozen splash screen.
-      ensureOllama().then(() => {
-        emitPhase("loading-voice");
-        if (!voiceProc && !app.isQuitting) {
-          voiceProc = startVoice();
-          safeSend("voice-status", voiceProc ? "running" : "error");
-        }
-      });
-    });
 }
 
 // ─── spawn voice ─────────────────────────────────────────────────────────────
@@ -538,7 +477,7 @@ function startVoice() {
       // the listen loop is about to start.
       if (msg.includes("AURA:VOICE_READY")) {
         emitPhase("ready");
-        _voiceRestartCount = 0;  // successful start — reset restart counter
+        auraRuntime.processes.voiceReady();
         // Push the current on-disk token to voice.py immediately.
         // voice.py validated the token at startup, but Electron may have a
         // fresher one (e.g. user logged in between voice restart and VOICE_READY).
@@ -607,29 +546,7 @@ function startVoice() {
     safeSend("voice-status", "stopped");
     voiceProc    = null;
     voicePaused  = false;
-
-    // Retry with exponential backoff on non-zero exits.
-    // Cap at 5 retries; give up after that — don't spam CPU with infinite restarts.
-    if (code !== 0 && !app.isQuitting) {
-      if (_voiceRestartCount < 5) {
-        const delay = Math.min(6000 * Math.pow(1.8, _voiceRestartCount), 60000);
-        _voiceRestartCount++;
-        console.log(`[AURA] Voice exited (code ${code}) — restart ${_voiceRestartCount}/5 in ${Math.round(delay / 1000)}s...`);
-        setTimeout(() => {
-          if (!voiceProc && !app.isQuitting) {
-            voiceProc = startVoice();
-            safeSend("voice-status", voiceProc ? "running" : "error");
-          }
-        }, delay);
-      } else {
-        console.error("[AURA] Voice process failed 5 times — giving up. Check logs for root cause.");
-        safeSend("voice-status", "failed");
-        emitPhase("ready");  // unblock UI from any lingering startup phase
-      }
-    } else if (code === 0) {
-      // Clean exit (user quit command or Ctrl+C in terminal) — don't restart
-      console.log("[AURA] Voice exited cleanly.");
-    }
+    auraRuntime.processes.voiceExited(code);
   });
 
   // Hard timeout: if voice never signals VOICE_READY within 180s, unblock UI anyway.
@@ -707,8 +624,7 @@ function createTray() {
             safeSend("voice-status", "stopped");
             safeSend("voice-paused", false);
           } else {
-            _voiceRestartCount = 0;  // manual start always resets backoff
-            voiceProc = startVoice();
+            voiceProc = auraRuntime.processes.startVoiceManually();
             safeSend("voice-status", voiceProc ? "running" : "error");
           }
           rebuildTrayMenu();
@@ -780,8 +696,7 @@ ipcMain.handle("save-settings", (_, settings) => {
 // ── voice process control ─────────────────────────────────────────────────────
 ipcMain.handle("voice-start",  () => {
   if (voiceProc) return "already_running";
-  _voiceRestartCount = 0;  // manual start resets backoff
-  voiceProc = startVoice();
+  voiceProc = auraRuntime.processes.startVoiceManually();
   return voiceProc ? "started" : "error";
 });
 ipcMain.handle("voice-stop",   () => {
@@ -898,6 +813,30 @@ app.whenReady().then(() => {
       onStatus: status => safeSend("ollama-status", status),
       onLog: (level, message) => console[level](message),
     },
+    processes: {
+      backendPort: BACKEND_PORT,
+      waitForBackend: (...args) => auraRuntime.backendReadiness.waitForBackend(...args),
+      ensureOllama: () => ensureOllama(),
+      spawnBackend: serverFile => spawnBackendProcess(serverFile),
+      startVoice: () => {
+        voiceProc = startVoice();
+        return voiceProc;
+      },
+      hasBackend: () => Boolean(backendProc),
+      hasVoice: () => Boolean(voiceProc),
+      isQuitting: () => app.isQuitting,
+      emitPhase,
+      sendBackendStatus: status => safeSend("backend-status", status),
+      sendVoiceStatus: status => safeSend("voice-status", status),
+      log: (level, ...args) => console[level](...args),
+      sendVoiceQuit: () => {
+        if (voiceProc && voiceProc.stdin && !voiceProc.stdin.destroyed) {
+          try { voiceProc.stdin.write("QUIT\n"); } catch {}
+        }
+      },
+      killVoice: () => { if (voiceProc) try { voiceProc.kill(); } catch {} },
+      killBackend: () => { if (backendProc) try { backendProc.kill(); } catch {} },
+    },
   });
   auraRuntime.on("runtime:state", state => safeSend("runtime-state", state));
   auraRuntime.on("timer:tick", timers => safeSend("timer-tick", timers));
@@ -935,21 +874,7 @@ app.on("before-quit", () => {
 
   // Clean up manager intervals/handles before exit
   auraRuntime?.stop();
-
-  // Send graceful quit signal to voice.py first (allows TTS drain + audio close).
-  if (voiceProc && voiceProc.stdin && !voiceProc.stdin.destroyed) {
-    try { voiceProc.stdin.write("QUIT\n"); } catch {}
-  }
-
-  // Give voice.py 2s to drain, then kill both processes.
-  // 2s is enough for current TTS pipeline; 400ms was too tight for audio device release.
-  setTimeout(() => {
-    if (voiceProc)   try { voiceProc.kill();   } catch {}
-    // Give backend an additional 500ms after voice is dead (it may be mid-write to Mongo)
-    setTimeout(() => {
-      if (backendProc) try { backendProc.kill(); } catch {}
-    }, 500);
-  }, 2000);
+  auraRuntime?.processes?.shutdown();
 });
 
 app.on("window-all-closed", () => {
