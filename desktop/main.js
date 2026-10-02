@@ -9,6 +9,7 @@ const http  = require("http");
 const { spawn, execFile,spawnSync } = require("child_process");
 
 const { AuraRuntime } = require("./core/auraRuntime");
+const { waitForBackend } = require("./core/backendReadiness");
 
 // ─── single instance lock ─────────────────────────────────────────────────────
 // Prevents double-click from launching a second Electron instance.
@@ -247,39 +248,6 @@ function createWindow() {
 
   mainWindow.on("maximize",   () => mainWindow.webContents.send("maximize-change", true));
   mainWindow.on("unmaximize", () => mainWindow.webContents.send("maximize-change", false));
-}
-
-// ─── backend health check ─────────────────────────────────────────────────────
-// Returns a Promise that resolves when the backend /api/health endpoint returns
-// 200 with ok:true (meaning both Express AND MongoDB are connected).
-// Rejects after `timeout` ms.
-function waitForBackend(port, timeout = 30000) {
-  return new Promise((resolve, reject) => {
-    const deadline = Date.now() + timeout;
-    const attempt = () => {
-      const req = http.get(`http://localhost:${port}/api/health`, (res) => {
-        // Only resolve if the health endpoint confirms MongoDB is ready (status 200).
-        // status 503 means Express is up but Mongo isn't — keep polling.
-        if (res.statusCode === 200) {
-          resolve();
-        } else if (Date.now() >= deadline) {
-          reject(new Error(`Backend health check timed out (last status: ${res.statusCode})`));
-        } else {
-          setTimeout(attempt, 600);
-        }
-        res.resume();
-      });
-      req.on("error", () => {
-        if (Date.now() >= deadline) {
-          reject(new Error("Backend health check timed out"));
-        } else {
-          setTimeout(attempt, 600);
-        }
-      });
-      req.setTimeout(500, () => req.destroy());
-    };
-    attempt();
-  });
 }
 
 // ─── Ollama health — three-tier check ────────────────────────────────────────
