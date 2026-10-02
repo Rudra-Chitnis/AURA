@@ -8,6 +8,11 @@
 > - `aura-core` is an experimental architectural refactor.
 > - Existing functionality should be preserved unless explicitly decided otherwise.
 > - Do not perform broad rewrites without understanding the current runtime first.
+>
+> Current contract inventory: [AURA_CORE_CONTRACTS.md](./AURA_CORE_CONTRACTS.md).
+> Where older sections below describe Electron-owned timers/reminders or a
+> proposed event taxonomy, the companion inventory documents the current
+> `aura-core` implementation and takes precedence.
 
 ---
 
@@ -85,7 +90,10 @@ The current system is effectively composed of four major runtime domains:
 
 MongoDB provides persistent storage.
 
-The Electron main process currently acts as the runtime supervisor.
+The Electron main process remains the desktop host and process adapter. Runtime
+startup/restart coordination has been extracted into
+`desktop/core/runtimeProcessCoordinator.js`, while process creation, OS handles,
+and Electron lifecycle callbacks remain in `desktop/main.js`.
 
 Conceptually:
 
@@ -118,7 +126,7 @@ Primary file:
 
 desktop/main.js
 
-Electron currently owns a large amount of system orchestration.
+Electron currently hosts the desktop runtime and retains OS/UI integration.
 
 Responsibilities include:
 
@@ -130,14 +138,13 @@ Responsibilities include:
 - checking backend health
 - checking Ollama availability
 - checking required Ollama models
-- startup phase management
+- startup phase forwarding and host phase updates
 - forwarding backend/voice logs
 - persistent application logging
 - tray integration
 - native window behavior
 - IPC
-- timer management
-- reminder management
+- Core timer/reminder adapter calls and event forwarding
 - notifications
 - voice process lifecycle
 - backend process lifecycle
@@ -145,9 +152,9 @@ Responsibilities include:
 - application settings/token persistence
 - communication with the React renderer
 
-Electron is therefore NOT currently just a UI shell.
-
-It is effectively the supervisor/orchestrator of the entire AURA runtime.
+Electron is therefore NOT currently just a UI shell. It composes the desktop
+Core, creates OS processes, and adapts runtime events to IPC and native OS
+behavior. Some sequencing/retry decisions now live in Core callbacks.
 
 This is one of the most important architectural facts.
 
@@ -605,29 +612,25 @@ It also communicates with Electron through stdin/stdout conventions.
 
 # 18. Voice → Electron Coupling
 
-The current voice runtime emits signals such as:
+The current voice runtime emits process signals such as:
 
 AURA:SET_TIMER:...
 
 AURA:SET_REMINDER:...
 
-Electron listens to these signals.
-
-Electron then takes ownership of scheduling and delivery.
+Electron still parses these stdout signals and adapts timer/reminder creation
+to the headless runtime in `desktop/core`. Timer/reminder scheduling and JSON
+persistence now live in `TimerManager` and `ReminderManager`; Electron retains
+the stdout adapter, IPC/UI synchronization, native notifications, and voice
+delivery.
 
 Therefore the current voice process is not autonomous.
 
 There is a direct protocol coupling:
 
-Python voice
-    |
-    | stdout protocol
-    v
-Electron main
-    |
-    +--> TimerManager
-    |
-    +--> ReminderManager
+Python voice --stdout--> Electron adapter --> desktop/core/AuraRuntime
+                                      ├--> TimerManager
+                                      └--> ReminderManager
 
 This is one of the most important boundaries to eliminate or redesign.
 
@@ -635,26 +638,29 @@ This is one of the most important boundaries to eliminate or redesign.
 
 # 19. Timer / Reminder Ownership
 
-Current timer and reminder systems are Electron-native.
+Desktop timer and reminder scheduling are currently in the headless runtime
+modules composed by Electron.
 
 Files:
 
-desktop/timerManager.js
-desktop/reminderManager.js
+desktop/core/timerManager.js
+desktop/core/reminderManager.js
 
-Electron currently owns:
+The desktop Core currently owns:
 
 - timer persistence
 - timer scheduling
 - reminder scheduling
 - startup recovery
-- notification delivery
-- UI synchronization
 
-This creates an architectural dependency:
+Electron still adapts Core events to renderer IPC, native notification delivery,
+and voice speech. Backend MongoDB reminders are a separate existing system and
+are not the same records as desktop reminders.
 
-Core functionality depends on Electron even though timers and reminders are
-conceptually application/runtime services rather than UI services.
+This leaves a host dependency:
+
+The runtime is still hosted/started by Electron, but timer and reminder logic
+no longer imports Electron APIs.
 
 Future AURA Core should own the logical timer/reminder service.
 
@@ -775,14 +781,13 @@ and tested.
 
 The biggest problem is NOT simply "Electron is heavy."
 
-The deeper problem is that Electron currently acts as:
+The deeper problem is that Electron still acts as:
 
 - UI host
 - process supervisor
 - startup manager
 - runtime coordinator
-- timer owner
-- reminder owner
+- desktop runtime host for timers and reminders
 - notification owner
 - authentication storage layer
 - IPC broker
@@ -1018,10 +1023,12 @@ justify it.
 
 ---
 
-# 33. Event Architecture
+# 33. Event Architecture — Earlier Proposal, Not Current Contract
 
-The existing WebSocket event system should evolve into a canonical event
-protocol.
+The names below were a proposal for a future protocol. They are not current
+event names and are not emitted by the implementation. The current events,
+payloads, APIs, and transport distinctions are documented in
+[AURA_CORE_CONTRACTS.md](./AURA_CORE_CONTRACTS.md).
 
 Potential event families:
 
@@ -1061,7 +1068,8 @@ runtime.ready
 runtime.warning
 runtime.error
 
-The exact protocol must be designed before implementation.
+Do not treat this list as the canonical contract or change current behavior to
+match it without a separate migration plan.
 
 ---
 
@@ -1126,9 +1134,10 @@ interface.
 
 ---
 
-# 37. First Architectural Milestones
+# 37. Architectural Milestones
 
-Recommended order:
+Original recommended sequence (some phases have since been completed on
+`aura-core`; see the contract inventory for current boundaries):
 
 PHASE 0
 Current-state documentation
@@ -1232,14 +1241,16 @@ The desired refactor is therefore:
 
 CURRENT:
 
-Electron
-    ├── UI
-    ├── lifecycle
-    ├── process management
-    ├── timers
-    ├── reminders
-    ├── IPC
-    └── runtime supervision
+Electron host
+    ├── UI / BrowserWindow / IPC / OS integration
+    ├── process spawning and OS handles
+    └── composes desktop Core
+             ├── timer/reminder state and scheduling
+             ├── deterministic timer/reminder actions
+             └── startup/restart coordination callbacks
+
+Backend host
+    └── composes backend Core for conversation and diagnostic/event routing
 
 TARGET:
 

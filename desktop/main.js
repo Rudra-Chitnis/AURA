@@ -8,6 +8,11 @@ const fs    = require("fs");
 const { spawn, execFile,spawnSync } = require("child_process");
 
 const { AuraRuntime } = require("./core/auraRuntime");
+const {
+  bindRuntimeEvents,
+  createRuntimeIpcAdapter,
+  registerRuntimeIpcHandlers,
+} = require("./adapters/runtimeIpcAdapter");
 
 // ─── single instance lock ─────────────────────────────────────────────────────
 // Prevents double-click from launching a second Electron instance.
@@ -71,6 +76,11 @@ function emitPhase(phase) {
   console.log(`[AURA] Startup phase: ${phase}`);
   if (_windowReady) safeSend("startup-phase", phase);
 }
+
+const runtimeIpcAdapter = createRuntimeIpcAdapter({
+  getRuntime: () => auraRuntime,
+  send: safeSend,
+});
 
 // ─── file logging ─────────────────────────────────────────────────────────────
 // Intercept all console output in the main process and tee it to a daily log
@@ -497,8 +507,8 @@ function startVoice() {
       if (timerMatch) {
         const secs  = parseInt(timerMatch[1], 10);
         const label = timerMatch[2].trim();
-        auraRuntime?.actions.dispatch({ type: "timer.create", label, seconds: secs });
-        if (auraRuntime) safeSend("timer-tick", auraRuntime.timers.listTimers());
+        runtimeIpcAdapter.dispatchAction({ type: "timer.create", label, seconds: secs });
+        runtimeIpcAdapter.sendTimerList();
         console.log(`[AURA] Timer registered via voice: "${label}" ${secs}s`);
       }
 
@@ -508,7 +518,7 @@ function startVoice() {
       if (reminderMatch) {
         const text   = reminderMatch[1].trim();
         const fireAt = reminderMatch[2].trim();
-        auraRuntime?.actions.dispatch({ type: "reminder.create", text, fireAt });
+        runtimeIpcAdapter.dispatchAction({ type: "reminder.create", text, fireAt });
         console.log(`[AURA] Reminder registered via voice: "${text}" at ${fireAt}`);
       }
 
@@ -762,28 +772,7 @@ function _speakViaVoice(text) {
 }
 
 // ── timer IPC handlers ────────────────────────────────────────────────────────
-ipcMain.handle("set-timer", (_, { label, seconds }) => {
-  const { result: timer } = auraRuntime.actions.dispatch({ type: "timer.create", label, seconds });
-  safeSend("timer-tick", auraRuntime.timers.listTimers());
-  return timer;
-});
-ipcMain.handle("cancel-timer", (_, id) => {
-  auraRuntime.actions.dispatch({ type: "timer.cancel", id });
-  safeSend("timer-tick", auraRuntime.timers.listTimers());
-  return true;
-});
-ipcMain.handle("list-timers", () => auraRuntime?.timers.listTimers() || []);
-
-// ── reminder IPC handlers ─────────────────────────────────────────────────────
-ipcMain.handle("set-reminder",    (_, { text, fireAt }) => {
-  const { result: r } = auraRuntime.actions.dispatch({ type: "reminder.create", text, fireAt });
-  return r;
-});
-ipcMain.handle("cancel-reminder", (_, id) => {
-  auraRuntime.actions.dispatch({ type: "reminder.cancel", id });
-  return true;
-});
-ipcMain.handle("list-reminders",  () => auraRuntime?.reminders.listReminders() || []);
+registerRuntimeIpcHandlers(ipcMain, runtimeIpcAdapter);
 
 // ── wake voice from sleep ─────────────────────────────────────────────────────
 ipcMain.handle("voice-wake", () => {
@@ -838,23 +827,19 @@ app.whenReady().then(() => {
       killBackend: () => { if (backendProc) try { backendProc.kill(); } catch {} },
     },
   });
-  auraRuntime.on("runtime:state", state => safeSend("runtime-state", state));
-  auraRuntime.on("timer:tick", timers => safeSend("timer-tick", timers));
-  auraRuntime.on("timer:fired", ({ timer, body }) => {
-    try {
-      if (Notification.isSupported()) new Notification({ title: "AURA Timer", body, silent: false }).show();
-    } catch (e) { console.warn("[TimerManager] Notification failed:", e.message); }
-    safeSend("timer-fired", { id: timer.id, label: timer.label, text: body });
-    safeSend("timer-tick", auraRuntime.timers.listTimers());
-    _speakViaVoice(body);
-  });
-  auraRuntime.on("reminder:updated", reminders => safeSend("reminder-updated", reminders));
-  auraRuntime.on("reminder:fired", ({ reminder, body }) => {
-    try {
-      if (Notification.isSupported()) new Notification({ title: "AURA Reminder", body, silent: false }).show();
-    } catch (e) { console.warn("[ReminderManager] Notification failed:", e.message); }
-    safeSend("reminder-fired", { id: reminder.id, text: reminder.text, body });
-    _speakViaVoice(body);
+  bindRuntimeEvents(auraRuntime, {
+    send: safeSend,
+    notifyTimer: body => {
+      try {
+        if (Notification.isSupported()) new Notification({ title: "AURA Timer", body, silent: false }).show();
+      } catch (e) { console.warn("[TimerManager] Notification failed:", e.message); }
+    },
+    notifyReminder: body => {
+      try {
+        if (Notification.isSupported()) new Notification({ title: "AURA Reminder", body, silent: false }).show();
+      } catch (e) { console.warn("[ReminderManager] Notification failed:", e.message); }
+    },
+    speak: _speakViaVoice,
   });
   emitPhase("launching");
   auraRuntime.start();
