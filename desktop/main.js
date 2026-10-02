@@ -8,8 +8,6 @@ const fs    = require("fs");
 const { spawn, execFile,spawnSync } = require("child_process");
 
 const { AuraRuntime } = require("./core/auraRuntime");
-const { waitForBackend } = require("./core/backendReadiness");
-const { createOllamaReadiness } = require("./core/ollamaReadiness");
 
 // ─── single instance lock ─────────────────────────────────────────────────────
 // Prevents double-click from launching a second Electron instance.
@@ -274,12 +272,6 @@ function createWindow() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const OLLAMA_PRIMARY_MODEL = process.env.OLLAMA_MODEL      || "mistral";
-const ollamaReadiness = createOllamaReadiness({
-  port: OLLAMA_PORT,
-  primaryModel: OLLAMA_PRIMARY_MODEL,
-  onStatus: status => safeSend("ollama-status", status),
-  onLog: (level, message) => console[level](message),
-});
 
 // ─── Ollama startup ───────────────────────────────────────────────────────────
 // Ensures Ollama server is running and the primary model is available.
@@ -288,12 +280,12 @@ async function ensureOllama() {
   emitPhase("checking-ollama");
 
   // ── Fast path: server already running ───────────────────────────────────────
-  const alreadyUp = await ollamaReadiness.checkServer(4000);
+  const alreadyUp = await auraRuntime.ollamaReadiness.checkServer(4000);
   if (alreadyUp) {
     console.log("[AURA] Ollama server already running on :11434");
     // Check model availability while we're here
-    const models = await ollamaReadiness.checkModels(3000);
-    if (ollamaReadiness.modelAvailable(models)) {
+    const models = await auraRuntime.ollamaReadiness.checkModels(3000);
+    if (auraRuntime.ollamaReadiness.modelAvailable(models)) {
       console.log(`[AURA] Model '${OLLAMA_PRIMARY_MODEL}' confirmed available.`);
       safeSend("ollama-status", "running");
     } else {
@@ -302,7 +294,7 @@ async function ensureOllama() {
       console.log(`[AURA] Ollama up — model '${OLLAMA_PRIMARY_MODEL}' not in /api/tags yet (may still be loading).`);
       safeSend("ollama-status", "loading-model");
       // Poll in background until model appears or 3-minute timeout
-      ollamaReadiness.pollUntilModelReady(0, 36);   // 36 × 5s = 3 min
+      auraRuntime.ollamaReadiness.pollUntilModelReady(0, 36);   // 36 × 5s = 3 min
     }
     return;
   }
@@ -327,18 +319,18 @@ async function ensureOllama() {
   }
 
   // ── Wait up to 45s for server to bind ───────────────────────────────────────
-  const serverReady = await ollamaReadiness.waitForServer(45000, 1500, 1500);
+  const serverReady = await auraRuntime.ollamaReadiness.waitForServer(45000, 1500, 1500);
   if (serverReady) {
     console.log("[AURA] Ollama server started.");
     // Now check model availability
-    const models = await ollamaReadiness.checkModels(3000);
-    if (ollamaReadiness.modelAvailable(models)) {
+    const models = await auraRuntime.ollamaReadiness.checkModels(3000);
+    if (auraRuntime.ollamaReadiness.modelAvailable(models)) {
       console.log(`[AURA] Model '${OLLAMA_PRIMARY_MODEL}' confirmed available.`);
       safeSend("ollama-status", "running");
     } else {
       console.log(`[AURA] Ollama up — model '${OLLAMA_PRIMARY_MODEL}' not loaded yet. Polling...`);
       safeSend("ollama-status", "loading-model");
-      ollamaReadiness.pollUntilModelReady(0, 36);
+      auraRuntime.ollamaReadiness.pollUntilModelReady(0, 36);
     }
     return;
   }
@@ -349,7 +341,7 @@ async function ensureOllama() {
   // so the user will eventually get a response.  Do NOT mark "unavailable" here.
   console.log("[AURA] Ollama still loading after 45s — polling in background.");
   safeSend("ollama-status", "starting");
-  ollamaReadiness.pollUntilServerReady(0, 72);   // 72 × 5s = 6 min total from spawn
+  auraRuntime.ollamaReadiness.pollUntilServerReady(0, 72);   // 72 × 5s = 6 min total from spawn
 }
 
 // ─── find Python executable ───────────────────────────────────────────────────
@@ -456,7 +448,7 @@ function _spawnBackend(serverFile) {
         if (!backendProc && !app.isQuitting) {
           _spawnBackend(serverFile);
           // Re-poll health to update voice and UI
-          waitForBackend(BACKEND_PORT, 20000)
+          auraRuntime.backendReadiness.waitForBackend(BACKEND_PORT, 20000)
             .then(() => {
               console.log("[AURA] Backend recovered — health check passed.");
               safeSend("backend-status", "online");
@@ -476,7 +468,7 @@ function _spawnBackend(serverFile) {
 
   // Wait for backend to be truly accepting HTTP connections (health endpoint = 200 + Mongo ready),
   // THEN check Ollama, THEN start voice. This is the correct sequential startup order.
-  waitForBackend(BACKEND_PORT, 40000)
+  auraRuntime.backendReadiness.waitForBackend(BACKEND_PORT, 40000)
     .then(async () => {
       console.log("[AURA] Backend health check passed.");
       _backendRestartCount = 0;  // reset counter on successful start
@@ -898,7 +890,15 @@ app.whenReady().then(() => {
 
   // The runtime owns scheduling and persistence; this shell adapter preserves
   // the existing IPC, OS notification, and voice delivery behavior.
-  auraRuntime = new AuraRuntime({ dataDirectory: app.getPath("userData") });
+  auraRuntime = new AuraRuntime({
+    dataDirectory: app.getPath("userData"),
+    ollama: {
+      port: OLLAMA_PORT,
+      primaryModel: OLLAMA_PRIMARY_MODEL,
+      onStatus: status => safeSend("ollama-status", status),
+      onLog: (level, message) => console[level](message),
+    },
+  });
   auraRuntime.on("runtime:state", state => safeSend("runtime-state", state));
   auraRuntime.on("timer:tick", timers => safeSend("timer-tick", timers));
   auraRuntime.on("timer:fired", ({ timer, body }) => {

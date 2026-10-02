@@ -1,14 +1,7 @@
 const express = require("express");
 const router = express.Router();
 
-const wsHub = require("../wsHub");
-const { RuntimeEventRouter } = require("../core/runtimeEventRouter");
-
-const eventRouter = new RuntimeEventRouter({
-  // Keep the existing lazy service load and diagnostic-failure fallback.
-  recordDiagnostic: event => require("../services/runtimeDiagnosticsService").record(event),
-  broadcastEvent: event => wsHub.broadcast(event),
-});
+const auraRuntime = require("../auraRuntime");
 
 // POST /api/events/push — local runtime event ingress.
 router.post("/push", (req, res) => {
@@ -22,7 +15,7 @@ router.post("/push", (req, res) => {
     }
     : null;
 
-  const result = eventRouter.route({ event, diagnosticEvent });
+  const result = auraRuntime.events.route({ event, diagnosticEvent });
   if (result.kind === "diagnostic") {
     return res.json({ ok: true, clients: 0, event: result.event });
   }

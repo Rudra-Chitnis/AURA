@@ -1,8 +1,7 @@
 const express = require("express");
 const router  = express.Router();
 
-const { runConversationTurn }                     = require("../core/conversationTurn");
-const diagnostics                                  = require("../services/runtimeDiagnosticsService");
+const auraRuntime                                  = require("../auraRuntime");
 const { createLog }                                = require("../services/logService");
 const protect                                      = require("../middleware/authMiddleware");
 
@@ -17,7 +16,7 @@ router.post("/ask", protect, async (req, res, next) => {
       return res.status(400).json({ message: "query is required" });
     }
 
-    const result = await runConversationTurn({
+    const result = await auraRuntime.conversation.runTurn({
       userId: req.user._id,
       query,
       timeContext: time_context,
@@ -29,7 +28,7 @@ router.post("/ask", protect, async (req, res, next) => {
     res.json(result);
 
   } catch (err) {
-    diagnostics.record({
+    auraRuntime.diagnostics.record({
       user: req.user?._id,
       source: "backend",
       type: err.code && String(err.code).startsWith("OLLAMA_") ? "generation_timeout" : "stream_abort",
@@ -62,7 +61,7 @@ router.post("/ask-stream", protect, async (req, res, next) => {
     res.setHeader("Connection",    "keep-alive");
     res.flushHeaders();
 
-    await runConversationTurn({
+    await auraRuntime.conversation.runTurn({
       userId: req.user._id,
       query,
       timeContext: time_context,
@@ -79,7 +78,7 @@ router.post("/ask-stream", protect, async (req, res, next) => {
   } catch (err) {
     const OLLAMA_CODES = new Set(["OLLAMA_FIRST_TOKEN_TIMEOUT", "OLLAMA_TOKEN_GAP_TIMEOUT"]);
     const isOllama     = OLLAMA_CODES.has(err.code);
-    diagnostics.record({
+    auraRuntime.diagnostics.record({
       user: req.user?._id,
       source: "backend",
       type: isOllama ? "generation_timeout" : "stream_abort",
